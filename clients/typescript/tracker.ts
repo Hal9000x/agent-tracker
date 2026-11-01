@@ -30,6 +30,44 @@ type Body<T> = (span: Span) => T | Promise<T>;
 const now = () => performance.timeOrigin + performance.now();
 const linkIds = (links: Array<Span | string>) => links.map((l) => (typeof l === "string" ? l : l.id));
 
+/** String(value), or a placeholder when even that throws. */
+const str = (value: unknown) => {
+  try {
+    return String(value);
+  } catch {
+    return "[unserializable]";
+  }
+};
+
+/** JSON.stringify with bigints as strings and cycles as "[Circular]". */
+function toJson(value: unknown): string | undefined {
+  const ancestors: unknown[] = [];
+  return JSON.stringify(value, function (this: unknown, _key: string, v: unknown) {
+    if (typeof v === "bigint") return v.toString();
+    if (typeof v !== "object" || v === null) return v;
+    while (ancestors.length && ancestors.at(-1) !== this) ancestors.pop();
+    if (ancestors.includes(v)) return "[Circular]";
+    ancestors.push(v);
+    return v;
+  });
+}
+
+/** Encodes field by field, so a value that still fails (a throwing getter or toJSON) becomes a string and the update is kept. */
+function encode(update: Record<string, unknown>): string {
+  const fields: string[] = [];
+  for (const [key, value] of Object.entries(update)) {
+    let json: string | undefined;
+    try {
+      // The daemon rejects attrs that are not an object, so they degrade one attr at a time.
+      json = key === "attrs" && value ? encode(value as Record<string, unknown>) : toJson(value);
+    } catch {
+      json = JSON.stringify(str(value));
+    }
+    if (json !== undefined) fields.push(`${JSON.stringify(key)}:${json}`);
+  }
+  return `{${fields.join(",")}}`;
+}
+
 export class Span {
   readonly traceId: string;
   readonly id: string;
@@ -85,7 +123,7 @@ export class Span {
       span_id: this.id,
       end: now(),
       status: failed ? "error" : "ok",
-      ...(failed ? { error: error instanceof Error ? error.message : String(error) } : {}),
+      ...(failed ? { error: error instanceof Error ? error.message : str(error) } : {}),
     });
   }
 }
@@ -165,7 +203,7 @@ export class Tracker {
     const req = fetch(`${this.url}/api/spans`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(update),
+      body: encode(update),
     })
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);

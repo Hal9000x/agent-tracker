@@ -19,6 +19,7 @@ from __future__ import annotations
 import atexit
 import contextvars
 import json
+import math
 import os
 import queue
 import secrets
@@ -35,6 +36,30 @@ _current: contextvars.ContextVar[Span | None] = contextvars.ContextVar("agent_tr
 
 def _now() -> float:
     return time.time() * 1000
+
+
+def _jsonable(value: Any, depth: int = 0) -> Any:
+    """`value` as plain JSON data: nan/inf become None, anything else JSON can't hold becomes a string."""
+    if value is None or isinstance(value, (str, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if depth < 32 and isinstance(value, dict):
+        return {k if isinstance(k, str) else str(k): _jsonable(v, depth + 1) for k, v in value.items()}
+    if depth < 32 and isinstance(value, (list, tuple)):
+        return [_jsonable(v, depth + 1) for v in value]
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _encode(update: dict[str, Any]) -> str | None:
+    """One update as strict JSON, or None to drop it, so a bad value never costs the rest of its batch."""
+    try:
+        return json.dumps(_jsonable(update), allow_nan=False)
+    except Exception:
+        return None
 
 
 class Span:
@@ -113,7 +138,8 @@ class Tracker:
             "attrs": attrs if parent else {"source": self.source, **(attrs or {})},
             "links": [l if isinstance(l, str) else l.id for l in links or []],
         }
-        self._send({k: v for k, v in update.items() if v not in (None, [], {})})
+        # No `v in (None, [], {})`: that calls the user's __eq__, which raises for numpy arrays.
+        self._send({k: v for k, v in update.items() if not (v is None or (isinstance(v, (list, dict)) and not v))})
         token = _current.set(span)
         try:
             yield span
@@ -174,7 +200,7 @@ class Tracker:
             try:
                 req = urllib.request.Request(
                     f"{self.url}/api/spans",
-                    data=json.dumps(batch, default=str).encode(),
+                    data=f"[{','.join(filter(None, map(_encode, batch)))}]".encode(),
                     headers={"content-type": "application/json"},
                 )
                 urllib.request.urlopen(req, timeout=5).close()
