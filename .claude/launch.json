@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "agent-tracker",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "--manifest-path", "daemon/Cargo.toml", "--", "--port", "4318", "--data", "data"],
+      "port": 4318
+    }
+  ]
+}
