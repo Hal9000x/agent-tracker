@@ -12,11 +12,12 @@ import {
   type Edge,
   type EdgeProps,
   type Node,
+  type NodeHandle,
   type NodeProps,
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   agentColor,
   agentGraph,
@@ -50,17 +51,31 @@ const LABEL = 20;
 // dagre recurses along long paths: ~160 ms at 1,000 chained nodes, stack
 // overflow near 1,800. Bigger graphs get the linear layered layout.
 const DAGRE_MAX_NODES = 1000;
+// The minimap draws every node and never culls: about 2.3 s to open 20k nodes.
+const MINIMAP_MAX_NODES = 2000;
+const HANDLE = 10; // .react-flow__handle in styles.css: 8px plus a 1px border
+// Declared so React Flow knows every node's handles without rendering it first to
+// measure them, which made onlyRenderVisibleElements render the whole graph once.
+const SPAN_HANDLES: NodeHandle[] = [
+  { type: "target", position: Position.Left, x: -HANDLE / 2, y: NODE_H / 2 - HANDLE / 2, width: HANDLE, height: HANDLE },
+  { type: "source", position: Position.Right, x: NODE_W - HANDLE / 2, y: NODE_H / 2 - HANDLE / 2, width: HANDLE, height: HANDLE },
+];
 
 type Mode = "steps" | "agents";
 type Point = { x: number; y: number };
 type Stats = { llm: number; tool: number; tokens: number; errors: number };
-type SpanData = { span: Span; agent?: string; now: number; dim: boolean; picked: boolean; stats?: Stats };
+type SpanData = { span: Span; agent?: string; dim: boolean; picked: boolean; stats?: Stats };
 type GroupData = { label: string; color: string };
 type SpanNode = Node<SpanData, "span" | "agent">;
 type GroupNode = Node<GroupData, "agentGroup">;
 
+// The ticking clock reaches nodes through context, so a tick re-renders the few
+// nodes on screen instead of handing React Flow a new object for every node.
+const Now = createContext(0);
+
 function StepNode({ data }: NodeProps<SpanNode>) {
-  const { span, agent, now, dim, picked } = data;
+  const { span, agent, dim, picked } = data;
+  const now = useContext(Now);
   return (
     <div className={`fnode status-${span.status}${dim ? " dim" : ""}${picked ? " picked" : ""}`} style={{ "--kind": KIND_COLOR[span.kind] } as CSSProperties}>
       <Handle type="target" position={Position.Left} isConnectable={false} />
@@ -84,7 +99,8 @@ function StepNode({ data }: NodeProps<SpanNode>) {
 }
 
 function AgentNode({ data }: NodeProps<SpanNode>) {
-  const { span, agent, now, dim, picked, stats } = data;
+  const { span, agent, dim, picked, stats } = data;
+  const now = useContext(Now);
   const title = span.kind === "agent" ? (agent ?? span.name) : span.name;
   const parts = stats && [stats.llm && `${stats.llm} llm`, stats.tool && `${stats.tool} tools`, stats.tokens && `${fmtCount(stats.tokens)} tok`].filter(Boolean);
   return (
@@ -219,92 +235,98 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
   const lit = useMemo(() => (focus ? lineage(focus, edges) : null), [focus, edges]);
   const match = useMemo(() => (search.trim() ? compileFilter(search) : null), [search]);
 
-  const members = (n: Span) => agents?.owned.get(n.span_id) ?? [n];
-  const isDim = (n: Span) =>
-    (lit !== null && !lit.has(n.span_id)) ||
-    (match !== null && !members(n).some((s) => match(s, agentOf(s, tree)))) ||
-    (clip !== null && !members(n).some((s) => overlaps(s, clip[0], clip[1], now)));
+  // Only a clip makes dimming depend on the clock (running spans grow into it).
+  const clipNow = clip ? now : 0;
+  const flowNodes = useMemo(() => {
+    const members = (n: Span) => agents?.owned.get(n.span_id) ?? [n];
+    const isDim = (n: Span) =>
+      (lit !== null && !lit.has(n.span_id)) ||
+      (match !== null && !members(n).some((s) => match(s, agentOf(s, tree)))) ||
+      (clip !== null && !members(n).some((s) => overlaps(s, clip[0], clip[1], clipNow)));
 
-  const flowNodes: Node[] = nodes.map(
-    (n): SpanNode => ({
-      id: n.span_id,
-      type: agents ? "agent" : "span",
-      position: positions.get(n.span_id) ?? { x: 0, y: 0 },
-      width: NODE_W,
-      height: NODE_H,
-      // Without `measured`, a new node object resets React Flow's handle bounds,
-      // which makes onlyRenderVisibleElements render every node on each tick.
-      measured: { width: NODE_W, height: NODE_H },
-      zIndex: 1000,
-      data: {
-        span: n,
-        agent: agentOf(n, tree),
-        now,
-        dim: isDim(n),
-        picked: n.span_id === focus,
-        stats: agents
-          ? members(n).reduce(
-              (st, s) => ({
-                llm: st.llm + +(s.kind === "llm"),
-                tool: st.tool + +(s.kind === "tool"),
-                tokens: st.tokens + (s.tokens_in ?? 0) + (s.tokens_out ?? 0),
-                errors: st.errors + +(s.status === "error"),
-              }),
-              { llm: 0, tool: 0, tokens: 0, errors: 0 },
-            )
-          : undefined,
-      },
-    }),
-  );
+    const list: Node[] = nodes.map(
+      (n): SpanNode => ({
+        id: n.span_id,
+        type: agents ? "agent" : "span",
+        position: positions.get(n.span_id) ?? { x: 0, y: 0 },
+        width: NODE_W,
+        height: NODE_H,
+        measured: { width: NODE_W, height: NODE_H },
+        handles: SPAN_HANDLES,
+        zIndex: 1000,
+        data: {
+          span: n,
+          agent: agentOf(n, tree),
+          dim: isDim(n),
+          picked: n.span_id === focus,
+          stats: agents
+            ? members(n).reduce(
+                (st, s) => ({
+                  llm: st.llm + +(s.kind === "llm"),
+                  tool: st.tool + +(s.kind === "tool"),
+                  tokens: st.tokens + (s.tokens_in ?? 0) + (s.tokens_out ?? 0),
+                  errors: st.errors + +(s.status === "error"),
+                }),
+                { llm: 0, tool: 0, tokens: 0, errors: 0 },
+              )
+            : undefined,
+        },
+      }),
+    );
 
-  if (!agents) {
-    for (const a of tree.spans.filter((s) => s.kind === "agent")) {
-      const pts = [a, ...descendants(a, tree)].map((s) => positions.get(s.span_id)).filter((p) => !!p);
-      if (!pts.length) continue;
-      const b = bounds(pts);
-      const x = b.x0 - PAD;
-      const y = b.y0 - PAD - LABEL;
-      const name = agentOf(a, tree) ?? a.name;
-      const [width, height] = [b.x1 + NODE_W + PAD - x, b.y1 + NODE_H + PAD - y];
-      flowNodes.push({
-        id: `group:${a.span_id}`,
-        type: "agentGroup",
-        position: { x, y },
-        width,
-        height,
-        measured: { width, height },
-        zIndex: ancestors(a, tree).filter((s) => s.kind === "agent").length,
-        selectable: false,
-        focusable: false,
-        data: { label: name, color: agentColor(name) },
-      } satisfies GroupNode);
+    if (!agents) {
+      for (const a of tree.spans.filter((s) => s.kind === "agent")) {
+        const pts = [a, ...descendants(a, tree)].map((s) => positions.get(s.span_id)).filter((p) => !!p);
+        if (!pts.length) continue;
+        const b = bounds(pts);
+        const x = b.x0 - PAD;
+        const y = b.y0 - PAD - LABEL;
+        const name = agentOf(a, tree) ?? a.name;
+        const [width, height] = [b.x1 + NODE_W + PAD - x, b.y1 + NODE_H + PAD - y];
+        list.push({
+          id: `group:${a.span_id}`,
+          type: "agentGroup",
+          position: { x, y },
+          width,
+          height,
+          measured: { width, height },
+          handles: [],
+          zIndex: ancestors(a, tree).filter((s) => s.kind === "agent").length,
+          selectable: false,
+          focusable: false,
+          data: { label: name, color: agentColor(name) },
+        } satisfies GroupNode);
+      }
     }
-  }
+    return list;
+  }, [nodes, positions, agents, tree, lit, match, focus, clip, clipNow]);
 
-  const partLabel = (e: FlowEdge) => {
-    const src = tree.byId.get(e.source);
-    if (agents || src?.kind !== "split") return undefined;
-    const kids = tree.children.get(src.span_id) ?? [];
-    return `part ${kids.findIndex((k) => k.span_id === e.target) + 1}/${kids.length}`;
-  };
-
-  const flowEdgesRf: Edge[] = edges.map((e) => {
-    const dim = lit !== null && (e.back || !(lit.has(e.source) && lit.has(e.target)));
-    const color = e.link ? "#c58af9" : "#80868b";
-    const back = (positions.get(e.target)?.x ?? 0) <= (positions.get(e.source)?.x ?? 0);
-    return {
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      type: back ? "back" : "default",
-      animated: tree.byId.get(e.target)?.status === "running",
-      label: e.count > 1 ? `×${e.count}` : e.link ? "message" : back ? "returns" : partLabel(e),
-      className: dim ? "dim" : undefined,
-      markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
-      style: { stroke: color, strokeWidth: 1.5, ...(e.link ? { strokeDasharray: "6 4" } : {}) },
-      zIndex: 999,
+  const flowEdgesRf = useMemo(() => {
+    const partLabel = (e: FlowEdge) => {
+      const src = tree.byId.get(e.source);
+      if (agents || src?.kind !== "split") return undefined;
+      const kids = tree.children.get(src.span_id) ?? [];
+      return `part ${kids.findIndex((k) => k.span_id === e.target) + 1}/${kids.length}`;
     };
-  });
+
+    return edges.map((e): Edge => {
+      const dim = lit !== null && (e.back || !(lit.has(e.source) && lit.has(e.target)));
+      const color = e.link ? "#c58af9" : "#80868b";
+      const back = (positions.get(e.target)?.x ?? 0) <= (positions.get(e.source)?.x ?? 0);
+      return {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        type: back ? "back" : "default",
+        animated: tree.byId.get(e.target)?.status === "running",
+        label: e.count > 1 ? `×${e.count}` : e.link ? "message" : back ? "returns" : partLabel(e),
+        className: dim ? "dim" : undefined,
+        markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
+        style: { stroke: color, strokeWidth: 1.5, ...(e.link ? { strokeDasharray: "6 4" } : {}) },
+        zIndex: 999,
+      };
+    });
+  }, [edges, lit, positions, tree, agents]);
 
   const span = selected ? tree.byId.get(selected) : undefined;
 
@@ -341,28 +363,32 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
       </div>
       <div className="graph-area">
         <div className="canvas" ref={canvas}>
-          <ReactFlow
-            key={viewKey}
-            nodes={flowNodes}
-            edges={flowEdgesRf}
-            nodeTypes={nodeTypes}
-            edgeTypes={edgeTypes}
-            colorMode="dark"
-            onInit={(rf) => {
-              flow.current = rf;
-              setFlowKey(viewKey);
-            }}
-            onlyRenderVisibleElements
-            minZoom={0.05}
-            nodesDraggable={false}
-            nodesConnectable={false}
-            onNodeClick={(_, n) => n.type !== "agentGroup" && onSelect(n.id)}
-            onPaneClick={() => onSelect(null)}
-          >
-            <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#3c4043" />
-            <MiniMap pannable zoomable nodeColor={(n) => (n.type === "agentGroup" ? "transparent" : KIND_COLOR[(n.data as SpanData).span.kind])} maskColor="#20212499" />
-            <Controls showInteractive={false} />
-          </ReactFlow>
+          <Now.Provider value={now}>
+            <ReactFlow
+              key={viewKey}
+              nodes={flowNodes}
+              edges={flowEdgesRf}
+              nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
+              colorMode="dark"
+              onInit={(rf) => {
+                flow.current = rf;
+                setFlowKey(viewKey);
+              }}
+              onlyRenderVisibleElements
+              minZoom={0.05}
+              nodesDraggable={false}
+              nodesConnectable={false}
+              onNodeClick={(_, n) => n.type !== "agentGroup" && onSelect(n.id)}
+              onPaneClick={() => onSelect(null)}
+            >
+              <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#3c4043" />
+              {flowNodes.length <= MINIMAP_MAX_NODES && (
+                <MiniMap pannable zoomable nodeColor={(n) => (n.type === "agentGroup" ? "transparent" : KIND_COLOR[(n.data as SpanData).span.kind])} maskColor="#20212499" />
+              )}
+              <Controls showInteractive={false} />
+            </ReactFlow>
+          </Now.Provider>
         </div>
         {span && <SpanDetails span={span} tree={tree} now={now} onSelect={onSelect} onClose={() => onSelect(null)} />}
       </div>
