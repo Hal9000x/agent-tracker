@@ -9,25 +9,20 @@ Data arrives live over Server-Sent Events, so runs appear while they are still g
 
 ## Quick start
 
-Requires Rust 1.85+ and Node 22.18+ (Node 24 recommended).
+Building requires Rust 1.88+ and Node 22.18+ (Node 24 recommended). One command builds the UI and the server:
 
 ```bash
-cd web && npm install && npm run build && cd ..
+npm run build
 ```
 
-```bash
-cargo run --release --manifest-path daemon/Cargo.toml
-```
+That produces a single file, `daemon/target/release/agent-tracker.exe` (`agent-tracker` on macOS and Linux), with the UI built in. Copy it anywhere and double-click it, or run it from a terminal:
 
-Open http://127.0.0.1:4318, then send it something:
+- It starts on http://127.0.0.1:4318 and opens that page in your browser.
+- Click **Play demo runs** (or **▶ Demo** in the top bar) to replay three sample runs live: a single agent with a tool call, a research swarm (split, three parallel researchers, join, a fork into reviewers with a message between them), and a support handoff with a failing tool.
+- Starting it again while it runs just opens the browser on the running copy.
+- Traces are saved in a `data` folder next to where it was started.
 
-```bash
-node clients/typescript/examples/demo.ts
-```
-
-The demo plays three runs in real time: a single agent with a tool call, a research swarm (split, three parallel researchers, join, a fork into reviewers with a message between them), and a support handoff with a failing tool. `DEMO_SPEED=4` speeds it up.
-
-The release binary embeds the UI, so `daemon/target/release/agent-tracker` is all you need to ship. Flags: `--host` (default `127.0.0.1`), `--port` (default `4318`), `--data` (default `./data`).
+Flags: `--host` (default `127.0.0.1`), `--port` (default `4318`), `--data` (default `./data`), `--no-open` (don't open a browser).
 
 ## Sending data
 
@@ -51,7 +46,7 @@ Spans are classified with the [GenAI semantic conventions](https://opentelemetry
 
 ### TypeScript
 
-[`clients/typescript/tracker.ts`](clients/typescript/tracker.ts) is one dependency-free file. Spans nest by async context, so `Promise.all` inside a `fork` or `split` gives parallel branches.
+[`clients/typescript/tracker.ts`](clients/typescript/tracker.ts) is one dependency-free file. [`examples/demo.ts`](clients/typescript/examples/demo.ts) is the source of the built-in demo runs (`node clients/typescript/examples/demo.ts`, `DEMO_SPEED=4` to speed it up; [`scripts/record-demo.mjs`](scripts/record-demo.mjs) turns a run into the recording the server replays). Spans nest by async context, so `Promise.all` inside a `fork` or `split` gives parallel branches.
 
 ```ts
 import { Tracker } from "./tracker.ts";
@@ -92,7 +87,7 @@ See [`clients/python/examples/demo.py`](clients/python/examples/demo.py) for a s
 
 ### Raw HTTP
 
-`POST /api/spans` takes one span update or an array of them. Updates with the same `trace_id` + `span_id` merge, so you can report a span when it starts and again when it ends, in either order.
+`POST /api/spans` takes one span update or an array of them, sent as `application/json`. Updates with the same `trace_id` + `span_id` merge, so you can report a span when it starts and again when it ends, in either order.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -108,7 +103,7 @@ See [`clients/python/examples/demo.py`](clients/python/examples/demo.py) for a s
 | `attrs` | object | merged key by key |
 | `links` | string[] | span ids this span received output from; drawn as dashed message edges |
 
-Other endpoints: `GET /api/traces`, `GET /api/traces/{id}`, `GET /api/stream` (SSE), `POST /v1/traces` (OTLP), `POST /api/hooks/claude-code`.
+Other endpoints: `GET /api/traces`, `GET /api/traces/{id}`, `GET /api/stream` (SSE), `POST /v1/traces` (OTLP), `POST /api/hooks/claude-code`, `POST /api/demo` (replays the demo runs).
 
 ## Using the views
 
@@ -131,19 +126,23 @@ Spans live in memory and are appended to `data/spans.jsonl`. The log is replayed
 
 ## Development
 
-```bash
-cargo test --manifest-path daemon/Cargo.toml
-```
+Runs the server, UI and TypeScript client tests:
 
 ```bash
-cd web && npm test
+npm test
+```
+
+The Python client has its own:
+
+```bash
+python -m unittest clients/python/test_agent_tracker.py
 ```
 
 For UI work, run the daemon, then `npm run dev` in `web/`. Vite proxies `/api` and `/v1` to the daemon on port 4318 (override with `AGENT_TRACKER_URL`).
 
 ## Limits
 
-- No authentication. The daemon binds to `127.0.0.1` by default; only expose it on a trusted network.
+- No authentication. The daemon binds to `127.0.0.1` by default; only expose it on a trusted network. To keep web pages you visit from reaching it, it refuses requests that name a foreign `Host` (DNS rebinding) and writes that aren't `application/json` or `application/x-protobuf` (cross-site form posts).
 - No retention or delete yet. To start over, stop the daemon and remove `data/spans.jsonl`.
 - The Network table renders every row without virtualization, so traces with many thousands of spans will feel slow.
 - OTLP over gRPC and compressed OTLP/HTTP are not supported.

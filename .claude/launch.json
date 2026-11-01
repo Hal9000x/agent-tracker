@@ -4,7 +4,7 @@
     {
       "name": "agent-tracker",
       "runtimeExecutable": "cargo",
-      "runtimeArgs": ["run", "--manifest-path", "daemon/Cargo.toml", "--", "--port", "4318", "--data", "data"],
+      "runtimeArgs": ["run", "--manifest-path", "daemon/Cargo.toml", "--", "--port", "4318", "--data", "data", "--no-open"],
       "port": 4318
     }
   ]
