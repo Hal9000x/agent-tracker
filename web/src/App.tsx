@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { useNow, useTracker } from "./api";
+import { Component, useEffect, useMemo, useState, type ReactNode } from "react";
+import { playDemo, useNow, useTracker } from "./api";
 import { GraphView } from "./components/GraphView";
 import { NetworkView } from "./components/NetworkView";
 import { TraceList } from "./components/TraceList";
@@ -68,6 +68,9 @@ export function App() {
         </nav>
         <span className="grow" />
         {trace && <span className="trace-title">{trace.name}</span>}
+        <button className="tool-btn" title="Replay three sample agent runs" onClick={playDemo}>
+          ▶ Demo
+        </button>
         <span className={`conn ${conn}`} title="Connection to the tracker daemon">
           <span className="dot" />
           {conn}
@@ -77,11 +80,9 @@ export function App() {
         <TraceList traces={list} selected={route.traceId} onSelect={(id) => navigate({ ...route, traceId: id })} />
         <main>
           {viewProps ? (
-            route.view === "network" ? (
-              <NetworkView {...viewProps} paused={paused} onPause={setPaused} />
-            ) : (
-              <GraphView {...viewProps} />
-            )
+            <ViewBoundary retry={`${route.view}:${route.traceId}`}>
+              {route.view === "network" ? <NetworkView {...viewProps} paused={paused} onPause={setPaused} /> : <GraphView {...viewProps} />}
+            </ViewBoundary>
           ) : (
             <EmptyState hasTraces={list.length > 0} />
           )}
@@ -91,14 +92,45 @@ export function App() {
   );
 }
 
+interface BoundaryProps {
+  /** Changing it (another view or trace) clears the error and renders again. */
+  retry: string;
+  children: ReactNode;
+}
+
+/** Keeps a crash in one view from blanking the whole app. */
+class ViewBoundary extends Component<BoundaryProps, { error: string | null; retry: string }> {
+  state = { error: null as string | null, retry: this.props.retry };
+
+  static getDerivedStateFromError(e: unknown) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+
+  static getDerivedStateFromProps(props: BoundaryProps, state: { retry: string }) {
+    return props.retry === state.retry ? null : { error: null, retry: props.retry };
+  }
+
+  render() {
+    if (this.state.error === null) return this.props.children;
+    return (
+      <div className="empty center">
+        <p>This view failed to render. Pick another trace or view.</p>
+        <div className="error-banner">{this.state.error}</div>
+      </div>
+    );
+  }
+}
+
 function EmptyState({ hasTraces }: { hasTraces: boolean }) {
   if (hasTraces) return <div className="empty center">Select a trace.</div>;
   return (
     <div className="empty center onboarding">
       <h2>Waiting for agent traces</h2>
       <p>Send something to this tracker and it shows up here live.</p>
-      <h3>Try the demo</h3>
-      <pre>node clients/typescript/examples/demo.ts</pre>
+      <button className="primary-btn" onClick={playDemo}>
+        ▶ Play demo runs
+      </button>
+      <p className="muted">A single agent, a research swarm and a support handoff, replayed in real time.</p>
       <h3>Claude Code</h3>
       <p>
         Add the hooks from <code>integrations/claude-code/settings.json</code> to your Claude Code settings.

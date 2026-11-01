@@ -506,7 +506,7 @@ main {
   cursor: default;
 }
 
-.tr:nth-child(even) {
+.tr.alt {
   background: rgba(255, 255, 255, 0.025);
 }
 
@@ -1044,6 +1044,19 @@ main {
   margin: 18px 0 6px;
   font-size: 13px;
   color: var(--text);
+}
+
+.primary-btn {
+  margin-top: 8px;
+  padding: 6px 14px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #202124;
+  font-weight: 600;
+}
+
+.primary-btn:hover {
+  background: #aecbfa;
 }
 
 .onboarding pre {

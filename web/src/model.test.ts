@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentGraph, agentOf, buildTree, compileFilter, flowEdges, lineage, niceStep, packLanes, selfTime, type Kind, type Span } from "./model";
+import { agentGraph, agentOf, buildTree, compileFilter, flowEdges, flowRanks, lineage, niceStep, packLanes, selfTime, type Kind, type Span } from "./model";
 
 let seq = 0;
 function sp(span_id: string, parent_id: string | undefined, kind: Kind, start: number, end: number | undefined, extra: Partial<Span> = {}): Span {
@@ -48,6 +48,23 @@ describe("flowEdges", () => {
       sp("c", "main", "tool", 60, 70),
     ];
     expect(pairs(spans)).toEqual(["main>a", "main>b", "a>c", "b>c"].sort());
+  });
+
+  it("keeps siblings sequential behind a long background sibling", () => {
+    const spans = [sp("p", undefined, "agent", 0, 100), sp("a", "p", "tool", 1, 90), sp("b", "p", "tool", 10, 20), sp("c", "p", "tool", 30, 40)];
+    expect(pairs(spans)).toEqual(["p>a", "p>b", "b>c"].sort());
+  });
+
+  it("feeds a successor from a sibling's exit only once that exit has ended", () => {
+    // The Agent tool T returns at once; its background subagent A keeps working (G) while R runs.
+    const spans = [
+      sp("main", undefined, "agent", 0, 20),
+      sp("T", "main", "tool", 0, 2),
+      sp("A", "T", "agent", 2.5, 12),
+      sp("G", "A", "tool", 3, 12),
+      sp("R", "main", "tool", 5, 6),
+    ];
+    expect(pairs(spans)).toEqual(["main>T", "T>A", "A>G", "T>R"].sort());
   });
 
   it("keeps a running span's wave open", () => {
@@ -154,6 +171,25 @@ describe("filter", () => {
     expect(run("agent:research")).toEqual(["a", "b"]);
     expect(run("agent:billing")).toEqual([]);
   });
+
+  it("treats prototype names as unknown keys", () => {
+    for (const q of ["constructor:x", "toString:x", "__proto__:x", "hasOwnProperty:x"]) expect(run(q)).toEqual([]);
+  });
+
+  it("skips terms that have no value yet", () => {
+    expect(run("-")).toEqual(["a", "b"]);
+    expect(run("agent:")).toEqual(["a", "b"]);
+    expect(run("-kind:")).toEqual(["a", "b"]);
+    expect(run('web "')).toEqual(["a"]);
+  });
+
+  it("sees an agent that becomes known after the first search", () => {
+    // OTel exports children first, so a span's agent can arrive with its parent later.
+    const child = sp("c", "p", "llm", 1, 2, { name: "summarize" });
+    const f = compileFilter("researcher");
+    expect(f(child, undefined)).toBe(false);
+    expect(f(child, "researcher")).toBe(true);
+  });
 });
 
 describe("helpers", () => {
@@ -166,6 +202,17 @@ describe("helpers", () => {
     const parent = sp("p", undefined, "agent", 0, 100);
     const kids = [sp("a", "p", "tool", 10, 40), sp("b", "p", "tool", 30, 50), sp("c", "p", "tool", 90, 120)];
     expect(selfTime(parent, kids, 0)).toBe(100 - 40 - 10);
+  });
+
+  it("ranks nodes by longest path and cuts cycles", () => {
+    const spans = [sp("a", undefined, "step", 0, 1), sp("b", undefined, "step", 1, 2), sp("c", undefined, "step", 2, 3), sp("d", undefined, "step", 3, 4)];
+    const e = (source: string, target: string, back = false) => ({ id: `${source}->${target}`, source, target, link: false, back, count: 1 });
+    const ranks = (edges: ReturnType<typeof e>[]) => Object.fromEntries(flowRanks(spans, edges));
+    expect(ranks([e("a", "b"), e("b", "c"), e("a", "c"), e("c", "d")])).toEqual({ a: 0, b: 1, c: 2, d: 3 });
+    expect(ranks([e("a", "b"), e("b", "c"), e("c", "a", true)])).toEqual({ a: 0, b: 1, c: 2, d: 0 });
+    // Without the back flag, the cycle b -> c -> b is cut at b.
+    expect(ranks([e("a", "b"), e("b", "c"), e("c", "b"), e("d", "c")])).toEqual({ a: 0, b: 1, c: 2, d: 0 });
+    expect(flowRanks(spans, [e("b", "c"), e("c", "b")]).size).toBe(4);
   });
 
   it("picks 1-2-5 tick steps", () => {

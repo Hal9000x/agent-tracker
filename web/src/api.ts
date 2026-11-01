@@ -65,7 +65,7 @@ export function useTracker(selected: string | null, paused: boolean) {
     es.onerror = () => setConn("offline");
     es.addEventListener("update", (e) => {
       const u: Update = JSON.parse((e as MessageEvent).data);
-      queue.current.spans.push(...u.spans);
+      for (const s of u.spans) queue.current.spans.push(s); // a spread throws past ~130k arguments
       queue.current.traces.push(...u.traces);
       schedule();
     });
@@ -100,6 +100,11 @@ export function useTracker(selected: string | null, paused: boolean) {
   }, [selected, reload]);
 
   return { traces, spans, conn };
+}
+
+/** Asks the daemon to replay its built-in demo runs; they arrive over the live stream. */
+export function playDemo(): void {
+  fetch("/api/demo", { method: "POST", headers: { "content-type": "application/json" } }).catch(() => {});
 }
 
 /** Current time, ticking while `active` so running spans grow. */

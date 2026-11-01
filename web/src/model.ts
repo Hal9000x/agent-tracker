@@ -125,7 +125,7 @@ export function descendants(span: Span, tree: Tree): Span[] {
     if (seen.has(s.span_id)) continue;
     seen.add(s.span_id);
     out.push(s);
-    stack.push(...(tree.children.get(s.span_id) ?? []));
+    for (const k of tree.children.get(s.span_id) ?? []) stack.push(k);
   }
   return out;
 }
@@ -147,27 +147,35 @@ export interface FlowEdge {
 
 const PARALLEL: ReadonlySet<Kind> = new Set(["split", "fork"]);
 
-/** Groups siblings into waves of overlapping spans; waves run one after another. */
-function waves(kids: Span[]): Span[][] {
-  const out: Span[][] = [];
-  let waveEnd = -Infinity;
-  for (const k of kids) {
-    const end = k.end ?? Infinity;
-    if (out.length && k.start < waveEnd) {
-      out[out.length - 1].push(k);
-      waveEnd = Math.max(waveEnd, end);
-    } else {
-      out.push([k]);
-      waveEnd = end;
+/**
+ * For siblings in start order, the siblings each one follows: the latest to
+ * have finished by its start. One that finished before another of them began
+ * is superseded. Running spans never finish, so they gate nothing.
+ */
+function siblingPreds(kids: Span[]): Span[][] {
+  const done: Span[] = []; // started siblings that have an end, by end; swept up to `head`
+  let head = 0;
+  let frontier: Span[] = [];
+  return kids.map((k) => {
+    while (head < done.length && done[head].end! <= k.start) {
+      const s = done[head++];
+      frontier = [...frontier.filter((f) => f.end! > s.start), s];
     }
-  }
-  return out;
+    if (k.end !== undefined) {
+      let i = done.length;
+      while (i > head && done[i - 1].end! > k.end) i--;
+      done.splice(i, 0, k);
+    }
+    return frontier;
+  });
 }
 
 /**
- * How work flowed: a span leads into its first wave of children, each wave's
- * last steps lead into the next wave, and children of a split or fork are
- * always parallel branches. A single agent therefore reads as a straight chain.
+ * How work flowed: a child follows the siblings that had finished by its
+ * start (their last steps, if those had ended by then), else its parent; a
+ * span's own last steps are those of the children nothing followed. Children
+ * of a split or fork are always parallel branches. A single agent therefore
+ * reads as a straight chain.
  */
 export function flowEdges(tree: Tree): FlowEdge[] {
   const edges = new Map<string, FlowEdge>();
@@ -183,16 +191,19 @@ export function flowEdges(tree: Tree): FlowEdge[] {
     seen.add(span.span_id);
     const kids = tree.children.get(span.span_id) ?? [];
     if (!kids.length) return [span.span_id];
-    let prev = [span.span_id];
-    for (const wave of PARALLEL.has(span.kind) ? [kids] : waves(kids)) {
-      const exits: string[] = [];
-      for (const k of wave) {
-        for (const p of prev) add(p, k.span_id, false);
-        exits.push(...walk(k));
+    const preds: Span[][] = PARALLEL.has(span.kind) ? kids.map(() => []) : siblingPreds(kids);
+    const exits = new Map<Span, string[]>();
+    const followed = new Set<Span>();
+    kids.forEach((k, i) => {
+      if (!preds[i].length) add(span.span_id, k.span_id, false);
+      for (const p of preds[i]) {
+        followed.add(p);
+        // A step still running when k starts (e.g. a background subagent's) did not lead into k.
+        for (const x of exits.get(p)!) add((tree.byId.get(x)!.end ?? Infinity) <= k.start ? x : p.span_id, k.span_id, false);
       }
-      prev = exits;
-    }
-    return prev;
+      exits.set(k, walk(k));
+    });
+    return kids.filter((k) => !followed.has(k)).flatMap((k) => exits.get(k)!);
   };
   tree.roots.forEach(walk);
   for (const s of tree.spans) {
@@ -285,11 +296,12 @@ export function lineage(id: string, edges: FlowEdge[]): Set<string> {
 
 const textCache = new WeakMap<Span, string>();
 
-function searchText(s: Span, agent: string | undefined): string {
+/** The agent is left out: it is inherited, and a parent that arrives later changes it. */
+function searchText(s: Span): string {
   let t = textCache.get(s);
   if (t === undefined) {
     const payload = (v: unknown) => (v === undefined ? "" : typeof v === "string" ? v : JSON.stringify(v));
-    t = [s.name, agent, s.kind, s.model, s.error, payload(s.input), payload(s.output)].join("\n").toLowerCase();
+    t = [s.name, s.kind, s.model, s.error, payload(s.input), payload(s.output)].join("\n").toLowerCase();
     textCache.set(s, t);
   }
   return t;
@@ -298,19 +310,23 @@ function searchText(s: Span, agent: string | undefined): string {
 /**
  * DevTools-style filter: plain words match name/agent/payloads, `key:value`
  * matches a field (agent, kind, status, model, name), `-` negates. All terms must hold.
+ * Terms with no value yet (`-`, `agent:` while typing) are ignored.
  */
 export function compileFilter(query: string): (s: Span, agent: string | undefined) => boolean {
-  const terms = [...query.matchAll(/(-?)(?:(\w+):)?("[^"]*"|\S+)/g)].map(([, neg, key, raw]) => ({
-    neg: neg === "-",
-    key: key?.toLowerCase(),
-    value: raw.replace(/^"|"$/g, "").toLowerCase(),
-  }));
+  const terms = [...query.matchAll(/(-?)(?:(\w+):)?("[^"]*"|\S*)/g)]
+    .map(([, neg, key, raw]) => ({
+      neg: neg === "-",
+      key: key?.toLowerCase(),
+      value: raw.replace(/^"|"$/g, "").toLowerCase(),
+    }))
+    .filter((t) => t.value);
   if (!terms.length) return () => true;
   return (s, agent) =>
     terms.every(({ neg, key, value }) => {
       const field: Record<string, string | undefined> = { agent, kind: s.kind, type: s.kind, status: s.status, model: s.model, name: s.name };
-      const hit = key && key in field ? (field[key] ?? "").toLowerCase().includes(value) : searchText(s, agent).includes(key ? `${key}:${value}` : value);
-      return hit !== neg;
+      if (key && Object.hasOwn(field, key)) return (field[key] ?? "").toLowerCase().includes(value) !== neg;
+      const text = key ? `${key}:${value}` : value;
+      return (searchText(s).includes(text) || !!agent?.toLowerCase().includes(text)) !== neg;
     });
 }
 
@@ -327,6 +343,45 @@ export function packLanes(spans: Span[], now: number): number[] {
     laneEnds[lane] = endOf(s, now);
     return lane;
   });
+}
+
+/**
+ * Longest-path rank of each node from the roots along `edges` (return edges
+ * ignored), in linear time. A cycle is cut at its earliest node in `nodes` order.
+ */
+export function flowRanks(nodes: Span[], edges: FlowEdge[]): Map<string, number> {
+  const rank = new Map(nodes.map((n) => [n.span_id, 0]));
+  const succ = new Map<string, string[]>();
+  const indeg = new Map<string, number>();
+  for (const e of edges) {
+    if (e.back || e.source === e.target || !rank.has(e.source) || !rank.has(e.target)) continue;
+    (succ.get(e.source) ?? succ.set(e.source, []).get(e.source)!).push(e.target);
+    indeg.set(e.target, (indeg.get(e.target) ?? 0) + 1);
+  }
+  const queued = new Set<string>();
+  const queue: string[] = [];
+  const enqueue = (id: string) => {
+    queued.add(id);
+    queue.push(id);
+  };
+  for (const n of nodes) if (!indeg.get(n.span_id)) enqueue(n.span_id);
+  let next = 0;
+  for (let head = 0; head < nodes.length; head++) {
+    if (head === queue.length) {
+      // Only cycles are left.
+      while (queued.has(nodes[next].span_id)) next++;
+      enqueue(nodes[next].span_id);
+    }
+    const r = rank.get(queue[head])! + 1;
+    for (const t of succ.get(queue[head]) ?? []) {
+      if (queued.has(t)) continue;
+      if (r > rank.get(t)!) rank.set(t, r);
+      const d = indeg.get(t)! - 1;
+      indeg.set(t, d);
+      if (!d) enqueue(t);
+    }
+  }
+  return rank;
 }
 
 /** Duration not covered by any child span. */

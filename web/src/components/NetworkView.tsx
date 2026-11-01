@@ -1,4 +1,4 @@
-import { useMemo, useState, type KeyboardEvent, type MouseEvent } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
 import {
   agentColor,
   agentOf,
@@ -32,6 +32,8 @@ const COLUMNS: { id: Col; label: string }[] = [
   { id: "waterfall", label: "Waterfall" },
 ];
 const GRID = "minmax(200px, 2.4fr) 72px 64px minmax(120px, 1.3fr) 72px 72px minmax(220px, 3fr)";
+const ROW_H = 21; // .tr height in styles.css
+const CHUNK = 16; // rows; the rendered window moves in steps of this many, plus as much overscan
 
 export interface ViewProps {
   trace: TraceSummary;
@@ -60,13 +62,25 @@ export function NetworkView({ trace, tree, now, selected, onSelect, clip, onClip
   const [invert, setInvert] = useState(false);
   const [groups, setGroups] = useState<Set<string>>(new Set());
   const [sort, setSort] = useState<{ col: Col; dir: 1 | -1 }>({ col: "waterfall", dir: 1 });
+  const table = useRef<HTMLDivElement>(null);
+  const thead = useRef<HTMLDivElement>(null);
+  const [chunk, setChunk] = useState(0); // scrollTop in CHUNK-row steps
+  const [fit, setFit] = useState(60); // rows the viewport holds
+
+  useLayoutEffect(() => {
+    const el = table.current!;
+    const ro = new ResizeObserver(() => setFit(Math.ceil(el.clientHeight / ROW_H)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const agents = useMemo(() => new Map(tree.spans.map((s) => [s.span_id, agentOf(s, tree)])), [tree]);
   const depth = useMemo(() => new Map(tree.spans.map((s) => [s.span_id, ancestors(s, tree).length])), [tree]);
   const match = useMemo(() => compileFilter(query), [query]);
 
   const t0 = tree.spans.length ? tree.spans[0].start : trace.start;
-  const t1 = Math.max(t0 + 1, ...tree.spans.map((s) => endOf(s, now)));
+  let t1 = t0 + 1;
+  for (const s of tree.spans) t1 = Math.max(t1, endOf(s, now));
   const [w0, w1] = clip ?? [t0, t1];
   const wRange = Math.max(w1 - w0, 1e-6);
 
@@ -91,6 +105,8 @@ export function NetworkView({ trace, tree, now, selected, onSelect, clip, onClip
           return (x < y ? -1 : x > y ? 1 : 0) * sort.dir;
         });
   const indent = sort.col === "waterfall";
+  const first = Math.max(0, (chunk - 1) * CHUNK);
+  const last = Math.min(rows.length, (chunk + 2) * CHUNK + fit);
 
   const step = niceStep(wRange, 5);
   const ticks: number[] = [];
@@ -111,8 +127,15 @@ export function NetworkView({ trace, tree, now, selected, onSelect, clip, onClip
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     e.preventDefault();
     const i = rows.findIndex((s) => s.span_id === selected);
-    const next = rows[Math.min(Math.max(i + (e.key === "ArrowDown" ? 1 : -1), 0), rows.length - 1)];
-    if (next) onSelect(next.span_id);
+    const j = Math.min(Math.max(i + (e.key === "ArrowDown" ? 1 : -1), 0), rows.length - 1);
+    if (!rows[j]) return;
+    onSelect(rows[j].span_id);
+    // The row may not be rendered yet, so scroll by position rather than scrollIntoView.
+    const el = table.current!;
+    const top = j * ROW_H;
+    const bottom = top + ROW_H + thead.current!.offsetHeight;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
   };
 
   const exportClip = () => {
@@ -168,8 +191,14 @@ export function NetworkView({ trace, tree, now, selected, onSelect, clip, onClip
       </div>
       <Overview spans={tree.spans} t0={t0} t1={t1} now={now} clip={clip} onClip={onClip} />
       <div className={span ? "table-area with-details" : "table-area"}>
-        <div className="table" tabIndex={0} onKeyDown={onKey}>
-          <div className="thead" style={{ gridTemplateColumns: grid }}>
+        <div
+          className="table"
+          ref={table}
+          tabIndex={0}
+          onKeyDown={onKey}
+          onScroll={(e) => setChunk(Math.floor(e.currentTarget.scrollTop / (ROW_H * CHUNK)))}
+        >
+          <div className="thead" ref={thead} style={{ gridTemplateColumns: grid }}>
             {columns.map((c) => (
               <div
                 key={c.id}
@@ -197,7 +226,8 @@ export function NetworkView({ trace, tree, now, selected, onSelect, clip, onClip
                 </div>
               </div>
             )}
-            {rows.map((s) => {
+            <div style={{ height: first * ROW_H }} />
+            {rows.slice(first, last).map((s, k) => {
               const agent = agents.get(s.span_id);
               const parent = s.parent_id ? tree.byId.get(s.parent_id) : undefined;
               const end = endOf(s, now);
@@ -205,7 +235,7 @@ export function NetworkView({ trace, tree, now, selected, onSelect, clip, onClip
               return (
                 <div
                   key={s.span_id}
-                  className={`tr ${s.span_id === selected ? "selected" : ""} ${s.status === "error" ? "failed" : ""}`}
+                  className={`tr ${(first + k) % 2 ? "" : "alt"} ${s.span_id === selected ? "selected" : ""} ${s.status === "error" ? "failed" : ""}`}
                   style={{ gridTemplateColumns: grid }}
                   onClick={() => onSelect(s.span_id)}
                 >
@@ -235,6 +265,7 @@ export function NetworkView({ trace, tree, now, selected, onSelect, clip, onClip
                 </div>
               );
             })}
+            <div style={{ height: (rows.length - last) * ROW_H }} />
             {!rows.length && <div className="no-rows">No spans match the current filters.</div>}
           </div>
         </div>

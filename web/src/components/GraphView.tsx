@@ -16,7 +16,7 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   agentColor,
   agentGraph,
@@ -26,6 +26,7 @@ import {
   descendants,
   endOf,
   flowEdges,
+  flowRanks,
   fmtCount,
   fmtDuration,
   KIND_COLOR,
@@ -41,10 +42,17 @@ import { SpanDetails } from "./SpanDetails";
 
 const NODE_W = 230;
 const NODE_H = 88;
+const NODE_SEP = 28;
+const RANK_SEP = 70;
+const MARGIN = 24;
 const PAD = 14;
 const LABEL = 20;
+// dagre recurses along long paths: ~160 ms at 1,000 chained nodes, stack
+// overflow near 1,800. Bigger graphs get the linear layered layout.
+const DAGRE_MAX_NODES = 1000;
 
 type Mode = "steps" | "agents";
+type Point = { x: number; y: number };
 type Stats = { llm: number; tool: number; tokens: number; errors: number };
 type SpanData = { span: Span; agent?: string; now: number; dim: boolean; picked: boolean; stats?: Stats };
 type GroupData = { label: string; color: string };
@@ -126,9 +134,9 @@ function BackEdge({ id, sourceX, sourceY, targetX, targetY, markerEnd, style, la
 const nodeTypes = { span: StepNode, agent: AgentNode, agentGroup: GroupBox };
 const edgeTypes = { back: BackEdge };
 
-function layout(nodes: Span[], edges: FlowEdge[]): Map<string, { x: number; y: number }> {
+function dagreLayout(nodes: Span[], edges: FlowEdge[]): Map<string, Point> {
   const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: "LR", nodesep: 28, ranksep: 70, marginx: 24, marginy: 24 });
+  g.setGraph({ rankdir: "LR", nodesep: NODE_SEP, ranksep: RANK_SEP, marginx: MARGIN, marginy: MARGIN });
   g.setDefaultEdgeLabel(() => ({}));
   for (const n of nodes) g.setNode(n.span_id, { width: NODE_W, height: NODE_H });
   for (const e of edges) g.setEdge(e.source, e.target);
@@ -139,6 +147,54 @@ function layout(nodes: Span[], edges: FlowEdge[]): Map<string, { x: number; y: n
       return [n.span_id, { x: p.x - NODE_W / 2, y: p.y - NODE_H / 2 }];
     }),
   );
+}
+
+/** Column = longest path from the roots, row = order within the column. */
+function layeredLayout(nodes: Span[], edges: FlowEdge[]): Map<string, Point> {
+  const rank = flowRanks(nodes, edges);
+  const rows = new Map<number, number>();
+  return new Map(
+    nodes.map((n) => {
+      const r = rank.get(n.span_id)!;
+      const i = rows.get(r) ?? 0;
+      rows.set(r, i + 1);
+      return [n.span_id, { x: MARGIN + r * (NODE_W + RANK_SEP), y: MARGIN + i * (NODE_H + NODE_SEP) }];
+    }),
+  );
+}
+
+function layout(nodes: Span[], edges: FlowEdge[]): Map<string, Point> {
+  if (nodes.length <= DAGRE_MAX_NODES) {
+    try {
+      return dagreLayout(nodes, edges);
+    } catch (e) {
+      console.warn("dagre layout failed, using the layered layout", e);
+    }
+  }
+  return layeredLayout(nodes, edges);
+}
+
+function bounds(pts: Iterable<Point>) {
+  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (const p of pts) {
+    x0 = Math.min(x0, p.x);
+    y0 = Math.min(y0, p.y);
+    x1 = Math.max(x1, p.x);
+    y1 = Math.max(y1, p.y);
+  }
+  return { x0, y0, x1, y1 };
+}
+
+// Long runs are wide; fitting all of them makes nodes unreadable. Below a
+// readable zoom, start at the message on the left instead.
+function startViewport(positions: Map<string, Point>, w: number, h: number) {
+  const b = bounds(positions.values());
+  const [x0, x1] = [b.x0 - PAD, b.x1 + NODE_W + PAD];
+  const [y0, y1] = [b.y0 - PAD - LABEL, b.y1 + NODE_H + PAD];
+  const fit = Math.min((w - 60) / (x1 - x0), (h - 60) / (y1 - y0));
+  const zoom = Math.min(Math.max(fit, 0.6), 1);
+  const x = fit >= 0.6 ? (w - (x1 - x0) * zoom) / 2 - x0 * zoom : 30 - x0 * zoom;
+  return { x, y: (h - (y1 - y0) * zoom) / 2 - y0 * zoom, zoom };
 }
 
 export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewProps) {
@@ -176,6 +232,9 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
       position: positions.get(n.span_id) ?? { x: 0, y: 0 },
       width: NODE_W,
       height: NODE_H,
+      // Without `measured`, a new node object resets React Flow's handle bounds,
+      // which makes onlyRenderVisibleElements render every node on each tick.
+      measured: { width: NODE_W, height: NODE_H },
       zIndex: 1000,
       data: {
         span: n,
@@ -202,15 +261,18 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
     for (const a of tree.spans.filter((s) => s.kind === "agent")) {
       const pts = [a, ...descendants(a, tree)].map((s) => positions.get(s.span_id)).filter((p) => !!p);
       if (!pts.length) continue;
-      const x = Math.min(...pts.map((p) => p.x)) - PAD;
-      const y = Math.min(...pts.map((p) => p.y)) - PAD - LABEL;
+      const b = bounds(pts);
+      const x = b.x0 - PAD;
+      const y = b.y0 - PAD - LABEL;
       const name = agentOf(a, tree) ?? a.name;
+      const [width, height] = [b.x1 + NODE_W + PAD - x, b.y1 + NODE_H + PAD - y];
       flowNodes.push({
         id: `group:${a.span_id}`,
         type: "agentGroup",
         position: { x, y },
-        width: Math.max(...pts.map((p) => p.x)) + NODE_W + PAD - x,
-        height: Math.max(...pts.map((p) => p.y)) + NODE_H + PAD - y,
+        width,
+        height,
+        measured: { width, height },
         zIndex: ancestors(a, tree).filter((s) => s.kind === "agent").length,
         selectable: false,
         focusable: false,
@@ -246,20 +308,18 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
 
   const span = selected ? tree.byId.get(selected) : undefined;
 
-  // Long runs are wide; fitting all of them makes nodes unreadable. Below a
-  // readable zoom, start at the message on the left instead.
   const canvas = useRef<HTMLDivElement>(null);
-  const initialView = (rf: ReactFlowInstance) => {
-    const pts = [...positions.values()];
-    if (!pts.length || !canvas.current) return;
-    const [x0, x1] = [Math.min(...pts.map((p) => p.x)) - PAD, Math.max(...pts.map((p) => p.x)) + NODE_W + PAD];
-    const [y0, y1] = [Math.min(...pts.map((p) => p.y)) - PAD - LABEL, Math.max(...pts.map((p) => p.y)) + NODE_H + PAD];
-    const { clientWidth: w, clientHeight: h } = canvas.current;
-    const fit = Math.min((w - 60) / (x1 - x0), (h - 60) / (y1 - y0));
-    const zoom = Math.min(Math.max(fit, 0.6), 1);
-    const x = fit >= 0.6 ? (w - (x1 - x0) * zoom) / 2 - x0 * zoom : 30 - x0 * zoom;
-    rf.setViewport({ x, y: (h - (y1 - y0) * zoom) / 2 - y0 * zoom, zoom });
-  };
+  const flow = useRef<ReactFlowInstance | null>(null);
+  const viewKey = `${trace.trace_id}:${mode}`;
+  const [flowKey, setFlowKey] = useState(""); // viewKey of the ReactFlow that has initialized
+  const started = useRef("");
+  // After a trace switch the previous trace's spans render until this one's load.
+  const ownPositions = positions.size > 0 && tree.spans[0]?.trace_id === trace.trace_id;
+  useEffect(() => {
+    if (flowKey !== viewKey || started.current === viewKey || !ownPositions || !flow.current || !canvas.current) return;
+    started.current = viewKey;
+    flow.current.setViewport(startViewport(positions, canvas.current.clientWidth, canvas.current.clientHeight));
+  }, [flowKey, viewKey, ownPositions, positions]);
 
   return (
     <div className="graph">
@@ -282,13 +342,17 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
       <div className="graph-area">
         <div className="canvas" ref={canvas}>
           <ReactFlow
-            key={`${trace.trace_id}:${mode}`}
+            key={viewKey}
             nodes={flowNodes}
             edges={flowEdgesRf}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             colorMode="dark"
-            onInit={initialView}
+            onInit={(rf) => {
+              flow.current = rf;
+              setFlowKey(viewKey);
+            }}
+            onlyRenderVisibleElements
             minZoom={0.05}
             nodesDraggable={false}
             nodesConnectable={false}

@@ -78,17 +78,22 @@ export function Overview({ spans, t0, t1, now, clip, onClip }: Props) {
     (e.target as Element).setPointerCapture(e.pointerId);
   };
 
+  // A handle dragged onto or past the other one would make a zero-width clip, and a tick label per step of it.
+  const setClip = (a: number, b: number) => {
+    if (toX(b) - toX(a) >= 1) onClip([a, b]);
+  };
+
   const onPointerMove = (e: PointerEvent) => {
     const d = drag.current;
     if (!d) return;
     const x = localX(e);
     if (d.mode === "new") {
-      if (Math.abs(x - d.x0) >= 3) onClip([toT(Math.min(x, d.x0)), toT(Math.max(x, d.x0))]);
-    } else if (d.mode === "left") onClip([Math.min(toT(x), d.b), d.b]);
-    else if (d.mode === "right") onClip([d.a, Math.max(toT(x), d.a)]);
+      if (Math.abs(x - d.x0) >= 3) setClip(toT(Math.min(x, d.x0)), toT(Math.max(x, d.x0)));
+    } else if (d.mode === "left") setClip(toT(x), d.b);
+    else if (d.mode === "right") setClip(d.a, toT(x));
     else {
       const dt = Math.min(Math.max(toT(x) - toT(d.x0), t0 - d.a), t1 - d.b);
-      onClip([d.a + dt, d.b + dt]);
+      setClip(d.a + dt, d.b + dt);
     }
   };
 
