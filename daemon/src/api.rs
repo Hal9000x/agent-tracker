@@ -1,10 +1,11 @@
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,6 +18,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::claude_code::ClaudeCode;
+use crate::demo;
 use crate::model::SpanUpdate;
 use crate::otlp;
 use crate::store::Store;
@@ -24,6 +26,8 @@ use crate::store::Store;
 pub struct App {
     pub store: Store,
     pub claude_code: ClaudeCode,
+    /// The --host address; requests naming any other host are refused.
+    pub bind_host: String,
 }
 
 #[derive(Embed)]
@@ -37,10 +41,45 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/traces/{id}", get(get_trace))
         .route("/api/stream", get(stream))
         .route("/api/hooks/claude-code", post(claude_code_hook))
+        .route("/api/demo", post(play_demo))
         .route("/v1/traces", post(otlp_traces))
         .fallback(static_files)
         .layer(DefaultBodyLimit::max(64 << 20))
+        .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
+}
+
+/// The server has no auth, so keep web pages out: a foreign Host header means
+/// DNS rebinding, and writes must use a content type that a browser cannot send
+/// cross-site without a CORS preflight (which this server never answers).
+async fn guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    match refusal(&app.bind_host, &req) {
+        Some(refused) => refused.into_response(),
+        None => next.run(req).await,
+    }
+}
+
+fn refusal(bind_host: &str, req: &Request) -> Option<(StatusCode, &'static str)> {
+    let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    if !host_allowed(bind_host, header(header::HOST)) {
+        return Some((StatusCode::FORBIDDEN, "unexpected Host header"));
+    }
+    let essence = header(header::CONTENT_TYPE).split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    if req.method() == Method::POST && essence != "application/json" && essence != "application/x-protobuf" {
+        return Some((StatusCode::UNSUPPORTED_MEDIA_TYPE, "send application/json or application/x-protobuf"));
+    }
+    None
+}
+
+fn host_allowed(bind_host: &str, host: &str) -> bool {
+    if host.is_empty() || matches!(bind_host, "0.0.0.0" | "::" | "[::]") {
+        return true;
+    }
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    matches!(name, "localhost" | "127.0.0.1" | "::1") || name == bind_host.trim_matches(['[', ']'])
 }
 
 type ApiError = (StatusCode, String);
@@ -93,6 +132,25 @@ async fn claude_code_hook(State(app): State<Arc<App>>, Json(ev): Json<Value>) ->
     Ok(Json(Value::Object(Default::default())))
 }
 
+/// Replays the built-in demo recording in real time; its traces arrive over the stream.
+async fn play_demo(State(app): State<Arc<App>>) -> StatusCode {
+    let now = now_ms();
+    let steps = demo::plan(now, now as u64);
+    tokio::spawn(async move {
+        for (at, span) in steps {
+            let wait = at - now_ms();
+            if wait > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(wait / 1000.0)).await;
+            }
+            if let Err(e) = app.store.ingest(vec![span], at) {
+                eprintln!("demo stopped: {e}");
+                return;
+            }
+        }
+    });
+    StatusCode::ACCEPTED
+}
+
 async fn otlp_traces(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
     if !header(header::CONTENT_ENCODING).is_empty() && header(header::CONTENT_ENCODING) != "identity" {
@@ -137,7 +195,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> Router {
-        router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default() }))
+        router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), bind_host: "127.0.0.1".into() }))
     }
 
     async fn send(app: &Router, method: &str, uri: &str, content_type: &str, body: impl Into<Body>) -> (StatusCode, Value) {
@@ -173,6 +231,26 @@ mod tests {
         let (status, _) = send(&app, "POST", "/api/spans", "application/json", r#"{"span_id":"a"}"#).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(send(&app, "GET", "/api/traces/nope", "", "").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn refuses_cross_site_writes_and_foreign_hosts() {
+        let app = app();
+        let span = r#"{"trace_id":"t","span_id":"a"}"#;
+        // Browsers can send text/plain cross-site without a preflight; JSON and protobuf need one.
+        assert_eq!(send(&app, "POST", "/api/spans", "text/plain", span).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(send(&app, "POST", "/v1/traces", "text/plain", "x").await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(send(&app, "POST", "/api/demo", "", "").await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(send(&app, "POST", "/api/spans", "application/json; charset=utf-8", span).await.0, StatusCode::ACCEPTED);
+
+        // A DNS-rebinding page reaches 127.0.0.1 under its own host name.
+        let get = |host: &str| Request::builder().uri("/api/traces").header("host", host).body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(get("attacker.example:4318")).await.unwrap().status(), StatusCode::FORBIDDEN);
+        for ok in ["localhost:4318", "127.0.0.1:4318", "[::1]:4318", "localhost"] {
+            assert_eq!(app.clone().oneshot(get(ok)).await.unwrap().status(), StatusCode::OK, "{ok}");
+        }
+        let open = router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), bind_host: "0.0.0.0".into() }));
+        assert_eq!(open.oneshot(get("tracker.lan:4318")).await.unwrap().status(), StatusCode::OK, "--host 0.0.0.0 serves any host");
     }
 
     #[tokio::test]

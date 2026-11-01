@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -206,10 +208,8 @@ pub struct TraceSummary {
 impl TraceSummary {
     pub fn of<'a>(trace_id: &str, spans: impl IntoIterator<Item = &'a Span>) -> Option<TraceSummary> {
         let spans: Vec<&Span> = spans.into_iter().collect();
-        let is_root = |s: &Span| match &s.parent_id {
-            None => true,
-            Some(p) => !spans.iter().any(|o| &o.span_id == p),
-        };
+        let ids: HashSet<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
+        let is_root = |s: &Span| s.parent_id.as_deref().is_none_or(|p| !ids.contains(p));
         let root = spans
             .iter()
             .copied()
@@ -244,7 +244,7 @@ impl TraceSummary {
             spans: spans.len(),
             errors,
             agents,
-            tokens: spans.iter().map(|s| s.tokens_in.unwrap_or(0) + s.tokens_out.unwrap_or(0)).sum(),
+            tokens: spans.iter().fold(0u64, |n, s| n.saturating_add(s.tokens_in.unwrap_or(0)).saturating_add(s.tokens_out.unwrap_or(0))),
             source: attr("source").or_else(|| attr("service.name")),
             seq: spans.iter().map(|s| s.seq).max().unwrap_or(0),
         })
@@ -285,6 +285,13 @@ mod tests {
     fn unknown_kind_becomes_step() {
         let u: SpanUpdate = serde_json::from_str(r#"{"trace_id":"t","span_id":"s","kind":"retrieval"}"#).unwrap();
         assert_eq!(u.kind, Some(Kind::Step));
+    }
+
+    #[test]
+    fn huge_token_counts_saturate_instead_of_panicking() {
+        let a = Span::from_update(SpanUpdate { tokens_in: Some(u64::MAX), tokens_out: Some(1), ..SpanUpdate::new("t", "a") }, 0.0, 1);
+        let b = Span::from_update(SpanUpdate { tokens_in: Some(5), ..SpanUpdate::new("t", "b") }, 0.0, 2);
+        assert_eq!(TraceSummary::of("t", [&a, &b]).unwrap().tokens, u64::MAX);
     }
 
     #[test]

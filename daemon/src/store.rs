@@ -58,18 +58,29 @@ impl Store {
         Store { state: Mutex::default(), log: None, tx: broadcast::channel(1024).0 }
     }
 
-    /// Replays `dir/spans.jsonl` and appends new updates to it. A torn last line
-    /// (crash mid-write) is skipped.
+    /// Replays `dir/spans.jsonl` and appends new updates to it. Unreadable lines
+    /// (a torn last line after a crash) are skipped and counted.
     pub fn open(dir: &Path) -> io::Result<Store> {
         fs::create_dir_all(dir)?;
         let path = dir.join("spans.jsonl");
         let mut state = State::default();
+        let mut skipped = 0;
         if path.exists() {
             for line in BufReader::new(File::open(&path)?).lines() {
-                if let Ok(e) = serde_json::from_str::<LogEntry>(&line?) {
-                    state.apply(e.span, e.t);
+                let line = line?;
+                // Ingest already bounded the depth; the log wrapper adds two levels on top.
+                let mut de = serde_json::Deserializer::from_str(&line);
+                de.disable_recursion_limit();
+                match LogEntry::deserialize(&mut de) {
+                    Ok(e) => {
+                        state.apply(e.span, e.t);
+                    }
+                    Err(_) => skipped += 1,
                 }
             }
+        }
+        if skipped > 0 {
+            eprintln!("skipped {skipped} unreadable line(s) in {}", path.display());
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Store {
@@ -188,6 +199,17 @@ mod tests {
         f.write_all(b"{\"t\":2,\"span\":{\"trace_id\":\"t1\",\"sp").unwrap();
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.trace("t1").unwrap().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replay_keeps_deep_payloads_that_ingest_accepted() {
+        let dir = scratch_dir("deep");
+        let deep: serde_json::Value = serde_json::from_str(&format!("{}1{}", "[".repeat(126), "]".repeat(126))).unwrap();
+        let s = Store::open(&dir).unwrap();
+        s.ingest(vec![SpanUpdate { input: Some(deep), ..SpanUpdate::new("deep", "a") }], 1.0).unwrap();
+        drop(s);
+        assert!(Store::open(&dir).unwrap().trace("deep").is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 
