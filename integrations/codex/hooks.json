@@ -1,0 +1,100 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 --connect-timeout 0.2 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "commandWindows": "curl.exe -s -m 2 --connect-timeout 0.2 -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:4318/api/hooks/codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}
