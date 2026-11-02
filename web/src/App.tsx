@@ -1,5 +1,5 @@
 import { Component, useEffect, useMemo, useState, type ReactNode } from "react";
-import { playDemo, useNow, useTracker } from "./api";
+import { deleteTrace, playDemo, useNow, useTracker } from "./api";
 import { ConnectGuide } from "./components/ConnectGuide";
 import { GraphView } from "./components/GraphView";
 import { NetworkView } from "./components/NetworkView";
@@ -82,7 +82,16 @@ export function App() {
         </span>
       </header>
       <div className="body">
-        <TraceList traces={list} selected={route.traceId} onSelect={(id) => navigate({ ...route, traceId: id })} />
+        <TraceList
+          traces={list}
+          selected={route.traceId}
+          onSelect={(id) => navigate({ ...route, traceId: id })}
+          onDelete={(t) => {
+            if (!confirm(`Delete "${t.name}"? This cannot be undone.`)) return;
+            const next = list.find((o) => o.trace_id !== t.trace_id);
+            deleteTrace(t.trace_id).then(() => t.trace_id === route.traceId && navigate({ ...route, traceId: next?.trace_id ?? null }));
+          }}
+        />
         <main>
           {viewProps ? (
             <ViewBoundary retry={`${route.view}:${route.traceId}`}>

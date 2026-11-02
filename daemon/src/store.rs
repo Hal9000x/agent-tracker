@@ -9,19 +9,25 @@ use tokio::sync::broadcast;
 
 use crate::model::{Span, SpanUpdate, TraceSummary};
 
-/// What live subscribers receive after each ingested batch.
+/// What live subscribers receive after each ingested batch or delete.
 #[derive(Debug, Serialize)]
 pub struct Update {
     pub spans: Vec<Span>,
     pub traces: Vec<TraceSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<String>,
 }
 
-/// One line of the append-only log. `t` is the receive time, so replay fills
-/// missing start times exactly as the live ingest did.
+/// One line of the append-only log: a span update, or a tombstone for a deleted
+/// trace. `t` is the receive time, so replay fills missing start times exactly
+/// as the live ingest did.
 #[derive(Serialize, Deserialize)]
 struct LogEntry {
     t: f64,
-    span: SpanUpdate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    span: Option<SpanUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delete: Option<String>,
 }
 
 #[derive(Default)]
@@ -72,10 +78,13 @@ impl Store {
                 let mut de = serde_json::Deserializer::from_str(&line);
                 de.disable_recursion_limit();
                 match LogEntry::deserialize(&mut de) {
-                    Ok(e) => {
-                        state.apply(e.span, e.t);
+                    Ok(LogEntry { t, span: Some(span), .. }) => {
+                        state.apply(span, t);
                     }
-                    Err(_) => skipped += 1,
+                    Ok(LogEntry { delete: Some(trace_id), .. }) => {
+                        state.traces.remove(&trace_id);
+                    }
+                    _ => skipped += 1,
                 }
             }
         }
@@ -97,7 +106,7 @@ impl Store {
         if let Some(log) = &self.log {
             let mut w = log.lock().unwrap();
             for u in &updates {
-                serde_json::to_writer(&mut *w, &LogEntry { t: received, span: u.clone() })?;
+                serde_json::to_writer(&mut *w, &LogEntry { t: received, span: Some(u.clone()), delete: None })?;
                 w.write_all(b"\n")?;
             }
             w.flush()?;
@@ -122,8 +131,26 @@ impl Store {
             .filter_map(|t| TraceSummary::of(t, state.traces[t].values()))
             .collect();
         // No subscribers is fine.
-        let _ = self.tx.send(Arc::new(Update { spans, traces }));
+        let _ = self.tx.send(Arc::new(Update { spans, traces, deleted: Vec::new() }));
         Ok(())
+    }
+
+    /// Removes a trace; a tombstone in the log keeps it removed after a restart.
+    /// Returns whether it existed.
+    pub fn delete(&self, trace_id: &str, received: f64) -> io::Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if !state.traces.contains_key(trace_id) {
+            return Ok(false);
+        }
+        if let Some(log) = &self.log {
+            let mut w = log.lock().unwrap();
+            serde_json::to_writer(&mut *w, &LogEntry { t: received, span: None, delete: Some(trace_id.to_string()) })?;
+            w.write_all(b"\n")?;
+            w.flush()?;
+        }
+        state.traces.remove(trace_id);
+        let _ = self.tx.send(Arc::new(Update { spans: Vec::new(), traces: Vec::new(), deleted: vec![trace_id.to_string()] }));
+        Ok(true)
     }
 
     /// Newest first.
@@ -199,6 +226,30 @@ mod tests {
         f.write_all(b"{\"t\":2,\"span\":{\"trace_id\":\"t1\",\"sp").unwrap();
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.trace("t1").unwrap().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_trace_survives_replay_and_is_broadcast() {
+        let dir = scratch_dir("delete");
+        let s = Store::open(&dir).unwrap();
+        for b in batch() {
+            s.ingest(b, 0.0).unwrap();
+        }
+        s.ingest(vec![SpanUpdate::new("keep", "x")], 1.0).unwrap();
+        let mut rx = s.subscribe();
+        assert!(s.delete("t1", 2.0).unwrap());
+        assert!(!s.delete("t1", 2.0).unwrap(), "already gone");
+        assert_eq!(rx.try_recv().unwrap().deleted, vec!["t1".to_string()]);
+        assert!(s.trace("t1").is_none());
+        drop(s);
+
+        let replayed = Store::open(&dir).unwrap();
+        assert!(replayed.trace("t1").is_none());
+        assert!(replayed.trace("keep").is_some());
+        // The id can be reused after a delete.
+        replayed.ingest(vec![SpanUpdate::new("t1", "fresh")], 3.0).unwrap();
+        assert_eq!(replayed.trace("t1").unwrap().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

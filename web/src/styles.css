@@ -237,9 +237,38 @@ main {
 .trace {
   display: block;
   width: 100%;
+  box-sizing: border-box;
   text-align: left;
   padding: 7px 10px;
   border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+}
+
+.trace-delete {
+  margin-left: auto;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  color: var(--text-2);
+  visibility: hidden;
+}
+
+.trace:hover .trace-delete,
+.trace:focus-within .trace-delete {
+  visibility: visible;
+}
+
+.trace-delete:hover {
+  color: var(--error);
+  background: var(--bg-hover);
+}
+
+.source-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
 }
 
 .trace:hover {

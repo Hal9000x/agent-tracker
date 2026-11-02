@@ -6,6 +6,7 @@ export type Connection = "connecting" | "live" | "offline";
 interface Update {
   spans: Span[];
   traces: TraceSummary[];
+  deleted?: string[];
 }
 
 /** Keeps whichever copy has the higher server seq, so fetches and stream events can race safely. */
@@ -35,14 +36,20 @@ export function useTracker(selected: string | null, paused: boolean) {
   selectedRef.current = selected;
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
-  const queue = useRef<Update>({ spans: [], traces: [] });
+  const queue = useRef<Required<Update>>({ spans: [], traces: [], deleted: [] });
   const frame = useRef(0);
 
   const flush = () => {
     frame.current = 0;
-    const { spans: ss, traces: ts } = queue.current;
-    queue.current = { spans: [], traces: [] };
+    const { spans: ss, traces: ts, deleted } = queue.current;
+    queue.current = { spans: [], traces: [], deleted: [] };
     if (ts.length) setTraces((prev) => mergeBySeq(prev, ts, (t) => t.trace_id));
+    if (deleted.length)
+      setTraces((prev) => {
+        const next = new Map(prev);
+        for (const id of deleted) next.delete(id);
+        return next;
+      });
     const mine = ss.filter((s) => s.trace_id === selectedRef.current);
     if (mine.length) setSpans((prev) => mergeBySeq(prev, mine, (s) => s.span_id));
   };
@@ -51,10 +58,18 @@ export function useTracker(selected: string | null, paused: boolean) {
   };
 
   useEffect(() => {
+    // The fetched list is the truth (traces deleted meanwhile drop out), except
+    // where the stream already delivered something newer.
     const loadTraces = () =>
       fetch("/api/traces")
         .then((r) => r.json())
-        .then((list: TraceSummary[]) => setTraces((prev) => mergeBySeq(prev, list, (t) => t.trace_id)))
+        .then((list: TraceSummary[]) =>
+          setTraces((prev) => {
+            const fresh = new Map(list.map((t) => [t.trace_id, t]));
+            for (const [id, t] of prev) if ((fresh.get(id)?.seq ?? Infinity) < t.seq) fresh.set(id, t);
+            return fresh;
+          }),
+        )
         .catch(() => {});
     const es = new EventSource("/api/stream");
     es.onopen = () => {
@@ -67,6 +82,7 @@ export function useTracker(selected: string | null, paused: boolean) {
       const u: Update = JSON.parse((e as MessageEvent).data);
       for (const s of u.spans) queue.current.spans.push(s); // a spread throws past ~130k arguments
       queue.current.traces.push(...u.traces);
+      queue.current.deleted.push(...(u.deleted ?? []));
       schedule();
     });
     es.addEventListener("resync", () => {
@@ -100,6 +116,11 @@ export function useTracker(selected: string | null, paused: boolean) {
   }, [selected, reload]);
 
   return { traces, spans, conn };
+}
+
+/** Permanently removes a trace; every open view drops it via the live stream. */
+export function deleteTrace(id: string): Promise<void> {
+  return fetch(`/api/traces/${encodeURIComponent(id)}`, { method: "DELETE" }).then(() => {});
 }
 
 /** Asks the daemon to replay its built-in demo runs; they arrive over the live stream. */

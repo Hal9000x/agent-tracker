@@ -38,7 +38,7 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/api/spans", post(ingest_spans))
         .route("/api/traces", get(list_traces))
-        .route("/api/traces/{id}", get(get_trace))
+        .route("/api/traces/{id}", get(get_trace).delete(delete_trace))
         .route("/api/stream", get(stream))
         .route("/api/hooks/claude-code", post(claude_code_hook))
         .route("/api/demo", post(play_demo))
@@ -112,6 +112,14 @@ async fn list_traces(State(app): State<Arc<App>>) -> impl IntoResponse {
 
 async fn get_trace(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<impl IntoResponse, StatusCode> {
     app.store.trace(&id).map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn delete_trace(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+    match app.store.delete(&id, now_ms()) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "no such trace".into())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}"))),
+    }
 }
 
 /// `update` events carry merged spans plus their trace summaries. `resync`
@@ -221,6 +229,15 @@ mod tests {
         assert_eq!((spans[0]["end"].as_f64(), spans[0]["status"].as_str()), (Some(4.0), Some("ok")));
         let (_, traces) = send(&app, "GET", "/api/traces", "", "").await;
         assert_eq!((traces[0]["name"].as_str(), traces[0]["spans"].as_u64()), (Some("planner"), Some(2)));
+    }
+
+    #[tokio::test]
+    async fn deletes_a_trace() {
+        let app = app();
+        send(&app, "POST", "/api/spans", "application/json", r#"{"trace_id":"t","span_id":"a"}"#).await;
+        assert_eq!(send(&app, "DELETE", "/api/traces/t", "", "").await.0, StatusCode::NO_CONTENT);
+        assert_eq!(send(&app, "GET", "/api/traces/t", "", "").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(send(&app, "DELETE", "/api/traces/t", "", "").await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
