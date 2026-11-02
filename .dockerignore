@@ -1,0 +1,7 @@
+**/target
+**/target-test
+**/node_modules
+web/dist
+data
+.git
+.claude
