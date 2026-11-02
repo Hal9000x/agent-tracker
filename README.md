@@ -7,20 +7,74 @@ Agent Tracker records every step an AI agent takes after you send it a message, 
 
 Data arrives live over Server-Sent Events, so runs appear while they are still going.
 
-## Quick start
+## How to use
 
-Download the build for your system from the repository's Releases page; [TESTERS.md](TESTERS.md) walks through it. To build it yourself instead, you need Rust 1.88+ and Node 22.18+ (Node 24 recommended). One command builds the UI and the server:
+Agent Tracker is one program that runs on your own machine. It needs nothing else installed, and what it records stays there.
+
+### 1. Download and start it
+
+Download the file for your system from the [latest release](https://github.com/Hal9000x/agent-tracker/releases) and unpack it:
+
+| System | File |
+|---|---|
+| Windows | `agent-tracker-<version>-windows-x64.zip` |
+| macOS (Apple silicon and Intel) | `agent-tracker-<version>-macos-universal.tar.gz` |
+| Linux | `agent-tracker-<version>-linux-x64.tar.gz` |
+
+Then start it:
+
+- **Windows:** double-click `agent-tracker.exe`. The build isn't signed yet, so if SmartScreen says it protected your PC, click **More info**, then **Run anyway**.
+- **macOS:** in Terminal, in the unpacked folder, run `xattr -d com.apple.quarantine agent-tracker`, then `./agent-tracker`. The first command clears the block macOS puts on unsigned downloads.
+- **Linux:** run `./agent-tracker`.
+
+Your browser opens http://127.0.0.1:4318. Click **Play demo runs** to watch three sample runs arrive live: a single agent with a tool call, a research swarm, and a support handoff with a failing tool. Leave the program running while you work. Starting it again just opens the browser on the running copy, and closing its window stops it.
+
+### 2. Connect Claude Code and Codex
+
+In a terminal, in the unpacked folder, run:
+
+```bash
+./agent-tracker install
+```
+
+On Windows, that's `.\agent-tracker.exe install`. It adds the tracker's hooks to `~/.claude/settings.json`, and to `~/.codex/hooks.json` if you use Codex, and keeps a backup of each file beside it.
+
+- **Claude Code**, in the terminal or the desktop app's Code tab, picks up the hooks without a restart. Send a prompt and watch it appear.
+- **Codex:** run `codex`, type `/hooks` and approve the new hooks once. For its reasoning, also set `model_reasoning_summary = "detailed"` in `~/.codex/config.toml`.
+
+### 3. Track Claude Code on the web (optional)
+
+Sessions on claude.ai/code and the desktop app's cloud sessions need nothing set up on claude.ai. Do this once per repository. In your clone, run `install-web`, then commit the two files it writes and push them to the branch your web sessions start from, usually the default branch:
+
+```bash
+cd path/to/your-repo
+path/to/agent-tracker install-web
+git add .claude/settings.json .claude/agent-tracker-hook.mjs
+git commit -m "Track Claude Code on the web sessions"
+git push
+```
+
+From then on, while the tracker runs, each web session in that repository appears under `claude-code-web`, about 20 seconds behind. The sessions travel through branches named `agent-tracker/<session>` in the repository. Anyone who can read the repository can read those branches, so delete them when you're done. [Claude Code on the web](#claude-code-on-the-web) has the details.
+
+### 4. Track other agents (optional)
+
+Point any OpenTelemetry exporter at `http://127.0.0.1:4318/v1/traces`, or wrap your own agent with the TypeScript or Python client. [Sending data](#sending-data) shows both. The **Connect** panel in the tracker lists every source, with the snippet to copy and whether data from it is arriving.
+
+### Your data, and removing it
+
+Traces are saved in a per-user folder, printed at startup: `%LOCALAPPDATA%\agent-tracker` on Windows, `~/Library/Application Support/agent-tracker` on macOS, `~/.local/share/agent-tracker` on Linux. They include your prompts, tool output and the model's reasoning, in plain text. Delete a trace from the list, or delete the folder to remove everything.
+
+To remove the tracker, run `agent-tracker uninstall` to take its hooks out of Claude Code and Codex, and `agent-tracker uninstall-web` in each clone you set up for the web. Then delete the program and its data folder.
+
+## Build from source
+
+You need Rust 1.88+ and Node 22.18+ (Node 24 recommended). One command builds the UI and the server:
 
 ```bash
 npm run build
 ```
 
-That produces a single file, `daemon/target/release/agent-tracker.exe` (`agent-tracker` on macOS and Linux), with the UI built in. Copy it anywhere and double-click it, or run it from a terminal:
-
-- It starts on http://127.0.0.1:4318 and opens that page in your browser.
-- Click **Play demo runs** (or **▶ Demo** in the top bar) to replay three sample runs live: a single agent with a tool call, a research swarm (split, three parallel researchers, join, a fork into reviewers with a message between them), and a support handoff with a failing tool.
-- Starting it again while it runs just opens the browser on the running copy.
-- Traces are saved in a per-user folder, printed at startup: `%LOCALAPPDATA%\agent-tracker` on Windows, `~/Library/Application Support/agent-tracker` on macOS, `~/.local/share/agent-tracker` on Linux.
+That produces a single file, `daemon/target/release/agent-tracker.exe` (`agent-tracker` on macOS and Linux), with the UI built in. Copy it anywhere and use it like a download.
 
 Flags: `--host` (default `127.0.0.1`), `--port` (default `4318`), `--data` (default: the per-user folder), `--no-open` (don't open a browser), `--public-url` (see [Hosting](#hosting)). `agent-tracker --version` prints the version.
 
