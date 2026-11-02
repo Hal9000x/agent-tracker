@@ -285,8 +285,10 @@ mod tests {
         assert_eq!(stop[1], json!({"type": "command", "command": r#"node "$CLAUDE_PROJECT_DIR/.claude/agent-tracker-hook.mjs""#, "async": true}));
         assert_eq!(fs::read_to_string(repo.join(".claude/agent-tracker-hook.mjs")).unwrap(), WEB_HOOK);
         assert!(!repo.join(".claude/settings.json.bak-agent-tracker").exists(), "no backup to commit by mistake; git has the old file");
-        let clone = std::path::absolute(&repo).unwrap();
-        assert_eq!(read(&data.join("web-repos.json")), json!([clone]), "the tracker fetches from this clone");
+        // Git names the clone by its real path, which differs where the temp folder is a link (macOS).
+        let registered: Vec<PathBuf> = serde_json::from_value(read(&data.join("web-repos.json"))).unwrap();
+        let real = |p: &PathBuf| fs::canonicalize(p).unwrap();
+        assert_eq!(registered.iter().map(real).collect::<Vec<_>>(), [real(&repo)], "the tracker fetches from this clone");
 
         uninstall_web(&repo, &data).unwrap();
         assert_eq!(read(&repo.join(".claude/settings.json")), serde_json::from_str::<Value>(USERS).unwrap());
