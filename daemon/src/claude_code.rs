@@ -87,15 +87,15 @@ impl Tail {
 fn read_transcripts(projects: &Path, session: &mut Session, ev: &Value) -> Vec<SpanUpdate> {
     let s = |k: &str| ev.get(k).and_then(Value::as_str);
     let Some(main) = s("transcript_path").map(PathBuf::from) else { return Vec::new() };
-    let mut files = vec![(MAIN, main.clone())];
+    let mut files = vec![(MAIN, Some(main_agent(ev)), main.clone())];
     if let Some(agent) = s("agent_id") {
         let derived = main.with_extension("").join("subagents").join(format!("agent-{agent}.jsonl"));
-        files.push((agent, s("agent_transcript_path").map_or(derived, PathBuf::from)));
+        files.push((agent, s("agent_type"), s("agent_transcript_path").map_or(derived, PathBuf::from)));
     }
     let mut out = Vec::new();
-    for (parent, path) in files {
+    for (parent, agent, path) in files {
         let Some(path) = transcript_file(projects, &path) else { continue };
-        let tail = session.tails.entry(path.clone()).or_insert_with(|| Tail { offset: 0, transcript: Transcript::new(parent) });
+        let tail = session.tails.entry(path.clone()).or_insert_with(|| Tail { offset: 0, transcript: Transcript::new(parent, agent) });
         // A transcript that can't be read only means no model calls this time.
         let _ = tail.read_new(&path, &mut out);
         // A stopped subagent writes nothing more.
@@ -313,8 +313,6 @@ fn begin(session: &mut Session, trace_id: String, prompt: Option<&str>, ev: &Val
         Some(p) => truncate(p, 80),
         None => "(prompt not captured)".to_string(),
     };
-    // On a subagent's event, agent_type names the subagent, not the session's agent.
-    let agent = if ev.get("agent_id").is_some() { None } else { ev.get("agent_type").and_then(Value::as_str) };
     vec![
         SpanUpdate {
             kind: Some(Kind::Message),
@@ -330,11 +328,17 @@ fn begin(session: &mut Session, trace_id: String, prompt: Option<&str>, ev: &Val
             parent_id: Some(PROMPT.into()),
             kind: Some(Kind::Agent),
             name: Some("Claude Code".into()),
-            agent: Some(agent.unwrap_or("claude-code").to_string()),
+            agent: Some(main_agent(ev).to_string()),
             start: Some(now),
             ..SpanUpdate::new(trace_id, MAIN)
         },
     ]
+}
+
+/// The session's own agent. On a subagent's event, agent_type names the subagent instead.
+fn main_agent(ev: &Value) -> &str {
+    let own = if ev.get("agent_id").is_some() { None } else { ev.get("agent_type").and_then(Value::as_str) };
+    own.unwrap_or("claude-code")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -526,7 +530,11 @@ mod tests {
         // The next turn's call lands in that turn's trace.
         assert_eq!(llm_spans(&store, "p2"), [("msg_03".into(), MAIN.into(), Some(t0 + 62_000.0))]);
         let p1 = store.trace("p1").unwrap();
-        assert_eq!(p1.iter().find(|s| s.span_id == "msg_02").unwrap().output, Some(Value::from("The launch code is 42.")));
+        let by = |id: &str| p1.iter().find(|s| s.span_id == id).unwrap_or_else(|| panic!("no span {id}"));
+        assert_eq!(by("msg_02").output, Some(Value::from("The launch code is 42.")));
+        let reply = by("msg_02:m0");
+        assert_eq!((reply.kind, reply.parent_id.as_deref(), reply.agent.as_deref()), (Kind::Message, Some("msg_02"), Some("claude-code")));
+        assert_eq!(by("msg_01:r0").kind, Kind::Reasoning);
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -550,6 +558,8 @@ mod tests {
         parents.sort();
         let expected = [("msg_s1", "a1"), ("msg_s2", "a1"), ("msg_t1", "a2"), ("msg_t2", "a2")];
         assert_eq!(parents, expected.map(|(id, parent)| (id.to_string(), parent.to_string())));
+        let reply = store.trace("p1").unwrap().into_iter().find(|s| s.span_id == "msg_s2:m0").expect("the subagent's reply");
+        assert_eq!((reply.parent_id.as_deref(), reply.agent.as_deref()), (Some("msg_s2"), Some("Explore")));
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -576,7 +586,8 @@ mod tests {
         for (i, path) in refused.into_iter().enumerate() {
             assert_eq!(span_ids(i, path.clone()), [PROMPT, MAIN], "{}", path.display());
         }
-        assert_eq!(span_ids(99, projects.join("proj/sess-t.jsonl")), ["msg_01", "msg_02", "msg_03", PROMPT, MAIN]);
+        let read = span_ids(99, projects.join("proj/sess-t.jsonl"));
+        assert_eq!(read.iter().filter(|id| id.starts_with("msg_") && !id.contains(':')).count(), 3, "{read:?}");
         fs::remove_dir_all(&base).unwrap();
     }
 

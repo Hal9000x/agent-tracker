@@ -1,8 +1,9 @@
 //! Reads model calls out of a Claude Code session transcript (`<session>.jsonl`,
 //! or `<session>/subagents/agent-<id>.jsonl` for a subagent). Claude Code writes
 //! each API response as one `assistant` record per content block, all sharing
-//! `message.id`; every record becomes an update of that call's `llm` span. The
-//! format is undocumented, so records that don't fit are skipped.
+//! `message.id`. A response becomes an `llm` span that every record updates, with
+//! a `reasoning` span per thinking block and a `message` span per text block under
+//! it. The format is undocumented, so records that don't fit are skipped.
 
 use std::ops::Range;
 
@@ -10,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::model::{Kind, SpanUpdate};
 
-/// Characters of response text kept as a span's output.
+/// Characters of text kept as a span's output.
 const MAX_OUTPUT: usize = 20_000;
 /// Requests and responses are only referred to by the records right after them.
 const RECENT: usize = 4;
@@ -18,6 +19,8 @@ const RECENT: usize = 4;
 /// Parse state for one transcript file, fed the bytes appended to it.
 pub struct Transcript {
     parent: String,
+    /// Named on the spans of the response's text.
+    agent: Option<String>,
     /// An incomplete last line, finished by a later feed.
     partial: Vec<u8>,
     /// Assistant records carry no promptId; they belong to the latest user record's turn.
@@ -32,6 +35,10 @@ struct Call {
     id: String,
     start: f64,
     end: f64,
+    /// Content blocks seen; the next index when a record has no apiBlockIndex.
+    blocks: u64,
+    /// When the latest block finished, which is when the next one started.
+    block_end: Option<f64>,
     text: String,
     clipped: bool,
     tool_use_ids: Vec<Value>,
@@ -56,8 +63,16 @@ impl Call {
 
 impl Transcript {
     /// `parent` is the span the model calls hang under: `main`, or the subagent's id.
-    pub fn new(parent: impl Into<String>) -> Self {
-        Transcript { parent: parent.into(), partial: Vec::new(), prompt_id: None, requests: Vec::new(), calls: Vec::new() }
+    /// `agent` is the agent writing this transcript.
+    pub fn new(parent: &str, agent: Option<&str>) -> Self {
+        Transcript {
+            parent: parent.to_string(),
+            agent: agent.map(str::to_string),
+            partial: Vec::new(),
+            prompt_id: None,
+            requests: Vec::new(),
+            calls: Vec::new(),
+        }
     }
 
     /// Takes bytes appended to the file; an incomplete last line waits for the next feed.
@@ -67,17 +82,19 @@ impl Transcript {
         let lines: Vec<u8> = self.partial.drain(..=last).collect();
         let mut out: Vec<SpanUpdate> = Vec::new();
         for line in lines.split(|&b| b == b'\n') {
-            let Some(u) = self.record(line) else { continue };
-            // An update carries everything seen of its call, so it replaces the one before.
-            if out.last().is_some_and(|prev| prev.trace_id == u.trace_id && prev.span_id == u.span_id) {
-                out.pop();
+            for u in self.record(line).into_iter().flatten() {
+                // A call's update carries everything seen of it, so it replaces the earlier
+                // one, in place to keep the call ahead of its blocks.
+                match out.iter_mut().rev().find(|prev| prev.trace_id == u.trace_id && prev.span_id == u.span_id) {
+                    Some(prev) => *prev = u,
+                    None => out.push(u),
+                }
             }
-            out.push(u);
         }
         out
     }
 
-    fn record(&mut self, line: &[u8]) -> Option<SpanUpdate> {
+    fn record(&mut self, line: &[u8]) -> Option<Vec<SpanUpdate>> {
         let r: Value = serde_json::from_slice(line).ok()?;
         match r.get("type")?.as_str()? {
             "user" => {
@@ -96,7 +113,8 @@ impl Transcript {
         }
     }
 
-    fn response_chunk(&mut self, r: &Value) -> Option<SpanUpdate> {
+    /// The call's update, then a span for each thinking or text block in the record.
+    fn response_chunk(&mut self, r: &Value) -> Option<Vec<SpanUpdate>> {
         let trace_id = self.prompt_id.clone()?;
         let time = epoch_ms(r.get("timestamp")?.as_str()?)?;
         let message = r.get("message")?;
@@ -110,23 +128,56 @@ impl Transcript {
         let sent = request.and_then(|rr| self.requests.iter().find(|(id, _)| id == rr)).map(|&(_, t)| t);
 
         if !self.calls.iter().any(|c| c.id == id) {
-            let call = Call { id: id.to_string(), start: time, end: time, text: String::new(), clipped: false, tool_use_ids: Vec::new() };
+            let call = Call {
+                id: id.to_string(),
+                start: time,
+                end: time,
+                blocks: 0,
+                block_end: None,
+                text: String::new(),
+                clipped: false,
+                tool_use_ids: Vec::new(),
+            };
             remember(&mut self.calls, call);
         }
         let call = self.calls.iter_mut().find(|c| c.id == id)?;
         call.start = call.start.min(sent.unwrap_or(time));
         call.end = call.end.max(time);
-        for block in message.get("content").and_then(Value::as_array).into_iter().flatten() {
-            // Thinking blocks are left out on purpose.
-            match block.get("type").and_then(Value::as_str) {
-                Some("text") => call.push_text(block.get("text").and_then(Value::as_str).unwrap_or_default()),
+
+        let mut blocks = Vec::new();
+        let first_index = r.get("apiBlockIndex").and_then(Value::as_u64).unwrap_or(call.blocks);
+        for (i, block) in message.get("content").and_then(Value::as_array).into_iter().flatten().enumerate() {
+            let index = first_index.saturating_add(i as u64);
+            let start = call.block_end.unwrap_or(call.start);
+            call.block_end = Some(time);
+            call.blocks = index.saturating_add(1);
+            let field = |k: &str| block.get(k).and_then(Value::as_str).unwrap_or_default();
+            let (kind, tag, name, output) = match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => (Kind::Reasoning, 'r', "reasoning", clip(field("thinking"))),
+                Some("redacted_thinking") => (Kind::Reasoning, 'r', "reasoning", "(redacted)".to_string()),
+                Some("text") => {
+                    call.push_text(field("text"));
+                    (Kind::Message, 'm', "assistant", clip(field("text")))
+                }
+                // The hooks report tool calls as their own spans.
                 Some("tool_use") => {
                     if let Some(tool) = block.get("id").filter(|v| v.is_string() && !call.tool_use_ids.contains(v)) {
                         call.tool_use_ids.push(tool.clone());
                     }
+                    continue;
                 }
-                _ => {}
-            }
+                _ => continue,
+            };
+            blocks.push(SpanUpdate {
+                parent_id: Some(id.to_string()),
+                kind: Some(kind),
+                name: Some(name.to_string()),
+                agent: if kind == Kind::Message { self.agent.clone() } else { None },
+                start: Some(start),
+                end: Some(time),
+                output: (!output.is_empty()).then(|| Value::from(output)),
+                ..SpanUpdate::new(trace_id.clone(), format!("{id}:{tag}{index}"))
+            });
         }
 
         let usage = |k: &str| message.get("usage").and_then(|u| u.get(k)).and_then(Value::as_u64);
@@ -141,7 +192,7 @@ impl Transcript {
         if !call.tool_use_ids.is_empty() {
             attrs.insert("tool_use_ids".into(), Value::Array(call.tool_use_ids.clone()));
         }
-        Some(SpanUpdate {
+        let llm = SpanUpdate {
             parent_id: Some(self.parent.clone()),
             kind: Some(Kind::Llm),
             name: model.map(str::to_string),
@@ -153,7 +204,16 @@ impl Transcript {
             tokens_out: usage("output_tokens"),
             attrs,
             ..SpanUpdate::new(trace_id, id)
-        })
+        };
+        Some(std::iter::once(llm).chain(blocks).collect())
+    }
+}
+
+/// At most MAX_OUTPUT characters, with an ellipsis when cut.
+fn clip(s: &str) -> String {
+    match s.char_indices().nth(MAX_OUTPUT) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
     }
 }
 
@@ -224,26 +284,27 @@ mod tests {
         1_768_471_200_000.0 + ms
     }
 
-    /// Feeds `text` in pieces of `step` bytes and returns the merged spans, sequence numbers cleared.
+    /// Feeds `text` in pieces of `step` bytes and returns the merged spans by id, sequence numbers cleared.
     fn spans(parent: &str, text: &str, step: usize) -> Vec<Span> {
         let store = Store::in_memory();
-        let mut transcript = Transcript::new(parent);
+        let mut transcript = Transcript::new(parent, Some("explorer"));
         for piece in text.as_bytes().chunks(step) {
             store.ingest(transcript.feed(piece), 0.0).unwrap();
         }
-        let spans = ["p1", "p2"].into_iter().filter_map(|p| store.trace(p)).flatten();
-        spans.map(|s| Span { seq: 0, ..s }).collect()
+        let mut spans: Vec<Span> = ["p1", "p2"].into_iter().filter_map(|p| store.trace(p)).flatten().map(|s| Span { seq: 0, ..s }).collect();
+        spans.sort_by(|a, b| a.span_id.cmp(&b.span_id));
+        spans
     }
 
     #[test]
     fn one_llm_span_per_model_call() {
-        let updates = Transcript::new("main").feed(MAIN.as_bytes());
-        let ids: Vec<(&str, &str)> = updates.iter().map(|u| (u.trace_id.as_str(), u.span_id.as_str())).collect();
+        let updates = Transcript::new("main", Some("claude-code")).feed(MAIN.as_bytes());
+        let calls: Vec<&SpanUpdate> = updates.iter().filter(|u| u.kind == Some(Kind::Llm)).collect();
+        let ids: Vec<(&str, &str)> = calls.iter().map(|u| (u.trace_id.as_str(), u.span_id.as_str())).collect();
         // A response's chunks collapse into one update per read.
         assert_eq!(ids, vec![("p1", "msg_01"), ("p1", "msg_02"), ("p2", "msg_03")]);
 
-        let first = &updates[0];
-        assert_eq!(first.kind, Some(Kind::Llm));
+        let first = calls[0];
         assert_eq!((first.parent_id.as_deref(), first.name.as_deref(), first.model.as_deref()), (Some("main"), Some("claude-opus-5-5"), Some("claude-opus-5-5")));
         assert_eq!((first.tokens_in, first.tokens_out), (Some(12 + 4000 + 300), Some(85)));
         assert_eq!((first.start, first.end), (Some(at(200.0)), Some(at(3000.0))), "from the request to the last chunk");
@@ -254,39 +315,68 @@ mod tests {
         let cache = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].map(|k| first.attrs[k].as_u64());
         assert_eq!(cache, [Some(12), Some(4000), Some(300)]);
 
-        let second = &updates[1];
+        let second = calls[1];
         assert_eq!((second.start, second.end, second.tokens_in), (Some(at(9100.0)), Some(at(10_000.0)), Some(5 + 4300 + 120)));
         assert_eq!(second.attrs["stop_reason"], "end_turn");
 
         // No request record: it starts at its first chunk. Only thinking and a tool call: no output.
-        let third = &updates[2];
+        let third = calls[2];
         assert_eq!((third.start, third.end, third.output.as_ref()), (Some(at(61_500.0)), Some(at(62_000.0)), None));
         assert_eq!(third.attrs["tool_use_ids"], json!(["toolu_bash"]));
+        assert!(!serde_json::to_string(&calls).unwrap().contains("THINKING-TEXT"), "thinking is not part of a call's output");
+    }
 
-        let all = serde_json::to_string(&updates).unwrap();
-        assert!(!all.contains("PRIVATE-THOUGHT"), "thinking stays out of the spans");
+    #[test]
+    fn blocks_become_reasoning_and_message_spans_in_order() {
+        let updates = Transcript::new("main", Some("claude-code")).feed(MAIN.as_bytes());
+        let order: Vec<&str> = updates.iter().map(|u| u.span_id.as_str()).collect();
+        // A call comes before its blocks. Tool calls get no span here: the hooks report them.
+        assert_eq!(order, ["msg_01", "msg_01:r0", "msg_01:m1", "msg_02", "msg_02:m0", "msg_03", "msg_03:r0", "msg_03:r1"]);
+        assert!(updates.iter().all(|u| u.trace_id == if u.span_id.starts_with("msg_03") { "p2" } else { "p1" }));
+        let by = |id: &str| updates.iter().find(|u| u.span_id == id).unwrap();
+        let shape = |id: &str| {
+            let u = by(id);
+            (u.kind, u.parent_id.as_deref(), u.name.as_deref(), u.agent.as_deref())
+        };
+        let times = |id: &str| (by(id).start, by(id).end);
+        let output = |id: &str| by(id).output.clone();
+
+        assert_eq!(shape("msg_01:r0"), (Some(Kind::Reasoning), Some("msg_01"), Some("reasoning"), None));
+        assert_eq!(output("msg_01:r0"), Some(Value::from("THINKING-TEXT: a subagent can read the notes")));
+        assert_eq!(shape("msg_01:m1"), (Some(Kind::Message), Some("msg_01"), Some("assistant"), Some("claude-code")));
+        assert_eq!(output("msg_01:m1"), Some(Value::from("I'll ask a subagent to look — it knows the files.")));
+        // The first block starts with its call; each later one where the block before it finished.
+        assert_eq!(times("msg_01:r0"), (Some(at(200.0)), Some(at(2000.0))));
+        assert_eq!(times("msg_01:m1"), (Some(at(2000.0)), Some(at(2500.0))));
+        assert_eq!(times("msg_02:m0"), (Some(at(9100.0)), Some(at(10_000.0))));
+        // Without apiBlockIndex, blocks are counted.
+        assert_eq!(times("msg_03:r0"), (Some(at(61_500.0)), Some(at(61_500.0))));
+        assert_eq!(times("msg_03:r1"), (Some(at(61_500.0)), Some(at(61_800.0))));
+        assert_eq!(output("msg_03:r1"), Some(Value::from("(redacted)")));
     }
 
     #[test]
     fn subagent_calls_hang_under_the_agent_in_the_parent_turn() {
         let spans = spans("a1", SUBAGENT, SUBAGENT.len());
-        let ids: Vec<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
-        assert_eq!(ids, ["msg_s1", "msg_s2"]);
-        assert!(spans.iter().all(|s| s.trace_id == "p1" && s.parent_id.as_deref() == Some("a1") && s.kind == Kind::Llm));
-        assert_eq!((spans[1].start, spans[1].output.as_ref()), (at(5200.0), Some(&Value::from("The launch code is 42."))));
+        let tree: Vec<(&str, Option<&str>)> = spans.iter().map(|s| (s.span_id.as_str(), s.parent_id.as_deref())).collect();
+        assert_eq!(tree, [("msg_s1", Some("a1")), ("msg_s2", Some("a1")), ("msg_s2:m0", Some("msg_s2"))]);
+        assert!(spans.iter().all(|s| s.trace_id == "p1"));
+        let reply = &spans[2];
+        assert_eq!((reply.agent.as_deref(), reply.start, reply.output.as_ref()), (Some("explorer"), at(5200.0), Some(&Value::from("The launch code is 42."))));
     }
 
     #[test]
     fn feeding_in_any_pieces_gives_the_same_spans() {
         let whole = spans("main", MAIN, MAIN.len());
-        assert_eq!(whole.len(), 3);
+        assert_eq!(whole.len(), 8);
         // One byte at a time also splits the multi-byte dash in msg_01's text.
         for step in [1, 7, 333] {
             assert_eq!(spans("main", MAIN, step), whole, "{step}-byte pieces");
         }
-        let mut t = Transcript::new("main");
+        let mut t = Transcript::new("main", None);
         let (newline, rest) = MAIN.as_bytes().split_last().unwrap();
-        assert_eq!(t.feed(rest).last().unwrap().end, Some(at(61_500.0)), "a last line without its newline waits");
+        let before = t.feed(rest).into_iter().find(|u| u.span_id == "msg_03").unwrap();
+        assert_eq!(before.end, Some(at(61_800.0)), "a last line without its newline waits");
         let finished = t.feed(&[*newline]);
         assert_eq!((finished.len(), finished[0].end), (1, Some(at(62_000.0))));
     }
@@ -303,22 +393,33 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-01-15T10:00:00Z","message":{"model":"m","content":[]}}"#,
             r#"{"type":"assistant","timestamp":"2026-01-15T10:00:00Z","message":{"id":"local","model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#,
             r#"{"type":"assistant","timestamp":"2026-01-15T10:00:01Z","message":{"id":"odd","content":"text","usage":{"output_tokens":"many"}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-15T10:00:02Z","apiBlockIndex":18446744073709551615,"message":{"id":"huge","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}}"#,
         ];
-        let updates = Transcript::new("main").feed(format!("{}\n", lines.join("\n")).as_bytes());
+        let updates = Transcript::new("main", None).feed(format!("{}\n", lines.join("\n")).as_bytes());
         let ids: Vec<&str> = updates.iter().map(|u| u.span_id.as_str()).collect();
-        assert_eq!(ids, ["odd"], "an odd shape still marks the call");
+        let max = u64::MAX;
+        assert_eq!(ids, ["odd".to_string(), "huge".into(), format!("huge:m{max}")], "odd shapes still mark the call, without overflowing");
         assert_eq!((updates[0].tokens_out, updates[0].model.as_ref(), updates[0].end), (None, None, Some(at(1000.0))));
     }
 
     #[test]
-    fn long_output_is_clipped() {
-        let chunk = |text: &str| json!({"type": "assistant", "timestamp": "2026-01-15T10:00:00Z", "message": {"id": "m", "content": [{"type": "text", "text": text}]}});
-        let lines = [json!({"type": "user", "promptId": "p"}), chunk(&"é".repeat(15_000)), chunk(&"z".repeat(15_000)), chunk("after")];
+    fn long_text_is_clipped() {
+        let chunk = |block: Value| json!({"type": "assistant", "timestamp": "2026-01-15T10:00:00Z", "message": {"id": "m", "content": [block]}});
+        let lines = [
+            json!({"type": "user", "promptId": "p"}),
+            chunk(json!({"type": "thinking", "thinking": "t".repeat(25_000)})),
+            chunk(json!({"type": "text", "text": "é".repeat(15_000)})),
+            chunk(json!({"type": "text", "text": "z".repeat(15_000)})),
+            chunk(json!({"type": "text", "text": "after"})),
+        ];
         let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        let output = Transcript::new("main").feed(text.as_bytes()).pop().unwrap().output.unwrap();
-        let output = output.as_str().unwrap();
-        assert_eq!(output.chars().count(), MAX_OUTPUT + 1);
-        assert!(output.starts_with('é') && output.ends_with("z…") && !output.contains("after"));
+        let updates = Transcript::new("main", None).feed(text.as_bytes());
+        let output = |id: &str| updates.iter().find(|u| u.span_id == id).unwrap().output.as_ref().unwrap().as_str().unwrap().to_string();
+        let call = output("m");
+        assert_eq!(call.chars().count(), MAX_OUTPUT + 1);
+        assert!(call.starts_with('é') && call.ends_with("z…") && !call.contains("after"));
+        assert_eq!(output("m:r0").chars().count(), MAX_OUTPUT + 1);
+        assert_eq!(output("m:m3"), "after", "each block is clipped on its own");
     }
 
     #[test]
