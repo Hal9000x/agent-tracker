@@ -1,5 +1,6 @@
 import { useState } from "react";
 import claudeCodeHooks from "../../../integrations/claude-code/settings.json?raw";
+import codexHooks from "../../../integrations/codex/hooks.json?raw";
 import { fmtAgo, type TraceSummary } from "../model";
 
 interface Harness {
@@ -17,9 +18,16 @@ const HARNESSES: Harness[] = [
   {
     name: "Claude Code",
     matches: (s) => s === "claude-code",
-    what: "Every prompt as a trace: tool calls, subagents, and the model calls read from the session transcript.",
+    what: "Every prompt as a trace: tool calls, subagents, and each model call with its reasoning and messages, read from the session transcript.",
     where: "Merge into ~/.claude/settings.json (all projects) or <project>/.claude/settings.local.json (one project). Running sessions pick it up without a restart.",
     snippet: claudeCodeHooks,
+  },
+  {
+    name: "Codex",
+    matches: (s) => s === "codex",
+    what: "Every turn of the Codex CLI or app as a trace: tool calls, subagents, and each model call with its reasoning summary and messages, read from the session's rollout file.",
+    where: "Save as ~/.codex/hooks.json (merge the event arrays if you already have one), then run codex, type /hooks and approve the new hooks once; Codex skips hooks nobody approved.",
+    snippet: codexHooks,
   },
   {
     name: "OpenTelemetry",
