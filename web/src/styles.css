@@ -82,6 +82,7 @@ input.filter:focus {
 .kind-split { --c: #fcad70; }
 .kind-fork { --c: #ff8bcb; }
 .kind-join { --c: #78d9ec; }
+.kind-reasoning { --c: #a8a2ff; }
 .kind-step { --c: #9aa0a6; }
 
 .kind-icon {
@@ -237,9 +238,38 @@ main {
 .trace {
   display: block;
   width: 100%;
+  box-sizing: border-box;
   text-align: left;
   padding: 7px 10px;
   border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+}
+
+.trace-delete {
+  margin-left: auto;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  color: var(--text-2);
+  visibility: hidden;
+}
+
+.trace:hover .trace-delete,
+.trace:focus-within .trace-delete {
+  visibility: visible;
+}
+
+.trace-delete:hover {
+  color: var(--error);
+  background: var(--bg-hover);
+}
+
+.source-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
 }
 
 .trace:hover {
@@ -1085,8 +1115,115 @@ main {
 /* ---- onboarding ---- */
 
 .onboarding {
-  max-width: 560px;
+  max-width: 720px;
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 24px;
   text-align: left;
+}
+
+/* ---- connect guide ---- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.modal {
+  width: min(760px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  padding: 0 20px 20px;
+}
+
+.modal-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 0 10px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.modal-head .close {
+  width: 28px;
+  height: 28px;
+  color: var(--text-2);
+}
+
+.connect .harness {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.connect .harness p {
+  margin: 4px 0;
+}
+
+.harness-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.harness-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.pill {
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  background: var(--border);
+  color: var(--text-2);
+}
+
+.pill.live {
+  background: rgba(129, 201, 149, 0.15);
+  color: var(--ok);
+}
+
+.snippet {
+  position: relative;
+  margin-top: 8px;
+}
+
+.snippet pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  white-space: pre;
+}
+
+.snippet .copy {
+  position: absolute;
+  top: 6px;
+  right: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
 }
 
 .onboarding h2 {

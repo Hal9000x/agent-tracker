@@ -1,6 +1,6 @@
 // Pure data logic shared by both views: span tree, flow graph, filters, formatting.
 
-export type Kind = "message" | "agent" | "llm" | "tool" | "split" | "fork" | "join" | "step";
+export type Kind = "message" | "agent" | "llm" | "tool" | "split" | "fork" | "join" | "reasoning" | "step";
 export type Status = "running" | "ok" | "error";
 
 export interface Span {
@@ -46,6 +46,7 @@ export const KIND_COLOR: Record<Kind, string> = {
   split: "#fcad70",
   fork: "#ff8bcb",
   join: "#78d9ec",
+  reasoning: "#a8a2ff",
   step: "#9aa0a6",
 };
 
@@ -53,6 +54,7 @@ export const KIND_GROUPS: { id: string; label: string; kinds: Kind[] }[] = [
   { id: "message", label: "Msg", kinds: ["message"] },
   { id: "agent", label: "Agent", kinds: ["agent"] },
   { id: "llm", label: "LLM", kinds: ["llm"] },
+  { id: "reasoning", label: "Reasoning", kinds: ["reasoning"] },
   { id: "tool", label: "Tool", kinds: ["tool"] },
   { id: "flow", label: "Split/Fork", kinds: ["split", "fork", "join"] },
   { id: "other", label: "Other", kinds: ["step"] },
@@ -417,6 +419,14 @@ export function fmtDuration(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)} ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(2)} s`;
   return `${(ms / 60_000).toFixed(1)} min`;
+}
+
+export function fmtAgo(ms: number): string {
+  const min = Math.floor(ms / 60_000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min} min ago`;
+  const h = Math.floor(min / 60);
+  return h < 24 ? `${h} h ago` : `${Math.floor(h / 24)} d ago`;
 }
 
 export function fmtCount(n: number): string {
