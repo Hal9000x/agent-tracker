@@ -236,6 +236,8 @@ fn begin(session: &mut Session, trace_id: String, prompt: Option<&str>, ev: &Val
         Some(p) => truncate(p, 80),
         None => "(prompt not captured)".to_string(),
     };
+    // On a subagent's event, agent_type names the subagent, not the session's agent.
+    let agent = if ev.get("agent_id").is_some() { None } else { ev.get("agent_type").and_then(Value::as_str) };
     vec![
         SpanUpdate {
             kind: Some(Kind::Message),
@@ -251,7 +253,7 @@ fn begin(session: &mut Session, trace_id: String, prompt: Option<&str>, ev: &Val
             parent_id: Some(PROMPT.into()),
             kind: Some(Kind::Agent),
             name: Some("Claude Code".into()),
-            agent: Some(ev.get("agent_type").and_then(Value::as_str).unwrap_or("claude-code").to_string()),
+            agent: Some(agent.unwrap_or("claude-code").to_string()),
             start: Some(now),
             ..SpanUpdate::new(trace_id, MAIN)
         },
@@ -372,6 +374,19 @@ mod tests {
         let ev = serde_json::json!({"session_id": "s", "prompt_id": "px", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1"});
         let ids: Vec<String> = cc.handle(&ev, 1.0, |_| false).into_iter().map(|u| u.span_id).collect();
         assert_eq!(ids, vec![PROMPT, MAIN, "t1"]);
+    }
+
+    #[test]
+    fn a_subagent_event_opening_the_trace_does_not_rename_the_main_agent() {
+        let main_agent = |ev: Value| {
+            let updates = ClaudeCode::default().handle(&ev, 1.0, |_| false);
+            updates.into_iter().find(|u| u.span_id == MAIN).and_then(|u| u.agent)
+        };
+        let ev = serde_json::json!({"session_id": "s", "prompt_id": "p", "hook_event_name": "PreToolUse", "agent_id": "a1", "agent_type": "Explore", "tool_name": "Grep", "tool_use_id": "t1"});
+        assert_eq!(main_agent(ev).as_deref(), Some("claude-code"));
+        // A session started with --agent is still named after that agent.
+        let ev = serde_json::json!({"session_id": "s", "prompt_id": "p", "hook_event_name": "UserPromptSubmit", "agent_type": "reviewer", "prompt": "hi"});
+        assert_eq!(main_agent(ev).as_deref(), Some("reviewer"));
     }
 
     #[test]
