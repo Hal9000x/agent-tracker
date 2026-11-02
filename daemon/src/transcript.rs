@@ -33,6 +33,9 @@ pub struct Transcript {
 /// What has been seen so far of one model call.
 struct Call {
     id: String,
+    /// The turn of its first chunk. A prompt sent while the response is being
+    /// written lands between its chunks and must not split it.
+    trace_id: String,
     start: f64,
     end: f64,
     /// Content blocks seen; the next index when a record has no apiBlockIndex.
@@ -115,7 +118,6 @@ impl Transcript {
 
     /// The call's update, then a span for each thinking or text block in the record.
     fn response_chunk(&mut self, r: &Value) -> Option<Vec<SpanUpdate>> {
-        let trace_id = self.prompt_id.clone()?;
         let time = epoch_ms(r.get("timestamp")?.as_str()?)?;
         let message = r.get("message")?;
         let id = message.get("id")?.as_str()?;
@@ -130,6 +132,7 @@ impl Transcript {
         if !self.calls.iter().any(|c| c.id == id) {
             let call = Call {
                 id: id.to_string(),
+                trace_id: self.prompt_id.clone()?,
                 start: time,
                 end: time,
                 blocks: 0,
@@ -141,6 +144,7 @@ impl Transcript {
             remember(&mut self.calls, call);
         }
         let call = self.calls.iter_mut().find(|c| c.id == id)?;
+        let trace_id = call.trace_id.clone();
         call.start = call.start.min(sent.unwrap_or(time));
         call.end = call.end.max(time);
 
@@ -400,6 +404,24 @@ mod tests {
         let max = u64::MAX;
         assert_eq!(ids, ["odd".to_string(), "huge".into(), format!("huge:m{max}")], "odd shapes still mark the call, without overflowing");
         assert_eq!((updates[0].tokens_out, updates[0].model.as_ref(), updates[0].end), (None, None, Some(at(1000.0))));
+    }
+
+    #[test]
+    fn a_prompt_sent_mid_response_does_not_split_the_call() {
+        let chunk = |id: &str, block: Value, ms: u32| json!({"type": "assistant", "timestamp": format!("2026-01-15T10:00:0{ms}Z"), "message": {"id": id, "content": [block]}});
+        let lines = [
+            json!({"type": "user", "promptId": "p1"}),
+            chunk("m", json!({"type": "text", "text": "working on it"}), 1),
+            // The user typed another message while the response was still being written.
+            json!({"type": "user", "promptId": "p2", "message": {"role": "user", "content": "also run the tests"}}),
+            chunk("m", json!({"type": "tool_use", "id": "toolu_x", "name": "Bash", "input": {}}), 2),
+            chunk("n", json!({"type": "text", "text": "on it"}), 3),
+        ];
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        let updates = Transcript::new("main", None).feed(text.as_bytes());
+        let placed: Vec<(&str, &str)> = updates.iter().map(|u| (u.trace_id.as_str(), u.span_id.as_str())).collect();
+        assert_eq!(placed, [("p1", "m"), ("p1", "m:m0"), ("p2", "n"), ("p2", "n:m0")]);
+        assert_eq!((updates[0].end, &updates[0].attrs["tool_use_ids"]), (Some(at(2000.0)), &json!(["toolu_x"])));
     }
 
     #[test]
