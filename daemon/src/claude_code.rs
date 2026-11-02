@@ -42,8 +42,6 @@ struct PendingAgent {
 struct OpenSpan {
     trace_id: String,
     span_id: String,
-    /// Subagents can keep working in the background after the user sends another prompt.
-    in_subagent: bool,
 }
 
 #[derive(Default)]
@@ -115,11 +113,9 @@ fn transcript_file(projects: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 impl Session {
-    /// Ends open spans as failed. Subagent work is left running unless `all`.
-    fn close_open(&mut self, now: f64, reason: &str, all: bool) -> Vec<SpanUpdate> {
-        let (closing, keep): (Vec<OpenSpan>, Vec<OpenSpan>) = std::mem::take(&mut self.open).into_iter().partition(|o| all || !o.in_subagent);
-        self.open = keep;
-        closing
+    /// Ends every open span as failed (the session is over).
+    fn close_open(&mut self, now: f64, reason: &str) -> Vec<SpanUpdate> {
+        std::mem::take(&mut self.open)
             .into_iter()
             .map(|o| SpanUpdate {
                 end: Some(now),
@@ -130,8 +126,19 @@ impl Session {
             .collect()
     }
 
-    fn opened(&mut self, trace_id: &str, span_id: &str, in_subagent: bool) {
-        self.open.push(OpenSpan { trace_id: trace_id.to_string(), span_id: span_id.to_string(), in_subagent });
+    /// Ends the previous turn's agent normally. Claude Code takes messages mid-turn
+    /// and keeps working, so a new prompt is not an interruption; tools still
+    /// running finish later in the trace they started in.
+    fn hand_over(&mut self, now: f64) -> Option<SpanUpdate> {
+        let i = self.open.iter().position(|o| o.span_id == MAIN)?;
+        let main = self.open.remove(i);
+        let mut attrs = Map::new();
+        attrs.insert("ended_by".into(), "next prompt".into());
+        Some(SpanUpdate { end: Some(now), status: Some(Status::Ok), attrs, ..SpanUpdate::new(main.trace_id, MAIN) })
+    }
+
+    fn opened(&mut self, trace_id: &str, span_id: &str) {
+        self.open.push(OpenSpan { trace_id: trace_id.to_string(), span_id: span_id.to_string() });
     }
 
     fn closed(&mut self, trace_id: &str, span_id: &str) {
@@ -172,13 +179,13 @@ impl ClaudeCode {
 
         match event {
             "UserPromptSubmit" => {
-                out.extend(session.close_open(now, "interrupted", false));
+                out.extend(session.hand_over(now));
                 let trace_id = s("prompt_id").map_or_else(|| format!("{session_id}-{now}"), str::to_string);
                 out.extend(begin(session, trace_id, s("prompt"), ev, now));
                 return out;
             }
             "SessionEnd" => {
-                out.extend(session.close_open(now, "session ended", true));
+                out.extend(session.close_open(now, "session ended"));
                 sessions.remove(session_id);
                 return out;
             }
@@ -189,7 +196,7 @@ impl ClaudeCode {
         if session.trace_id.is_none() {
             let trace_id = s("prompt_id").map_or_else(|| format!("{session_id}-{now}"), str::to_string);
             if known(&trace_id) {
-                session.opened(&trace_id, MAIN, false);
+                session.opened(&trace_id, MAIN);
                 session.trace_id = Some(trace_id);
             } else {
                 out.extend(begin(session, trace_id, None, ev, now));
@@ -220,7 +227,7 @@ impl ClaudeCode {
                 if let Some(mcp) = ev.get("mcp_server") {
                     attrs.insert("mcp_server".into(), mcp.clone());
                 }
-                session.opened(&trace_id, tool_use_id, agent_id.is_some());
+                session.opened(&trace_id, tool_use_id);
                 out.push(SpanUpdate {
                     parent_id: Some(agent_id.unwrap_or(MAIN).to_string()),
                     kind: Some(Kind::Tool),
@@ -233,6 +240,9 @@ impl ClaudeCode {
                 });
             }
             "PostToolUse" | "PostToolUseFailure" if !tool_use_id.is_empty() => {
+                // A tool started before a mid-turn prompt finishes in its own trace.
+                let started_in = session.open.iter().find(|o| o.span_id == tool_use_id).map(|o| o.trace_id.clone());
+                let trace_id = started_in.unwrap_or_else(|| trace_id.clone());
                 session.closed(&trace_id, tool_use_id);
                 let failed = event == "PostToolUseFailure";
                 let duration = ev.get("duration_ms").and_then(Value::as_f64);
@@ -246,7 +256,7 @@ impl ClaudeCode {
                     status: Some(if failed { Status::Error } else { Status::Ok }),
                     error: if failed { s("error").map(str::to_string) } else { None },
                     output: ev.get("tool_response").cloned(),
-                    ..span(tool_use_id)
+                    ..SpanUpdate::new(trace_id, tool_use_id)
                 });
             }
             "SubagentStart" => {
@@ -260,7 +270,7 @@ impl ClaudeCode {
                 let spawned_by = idx.map(|i| pending.remove(i));
                 let trace_id = spawned_by.as_ref().map_or(trace_id, |p| p.trace_id.clone());
                 session.agent_traces.insert(agent_id.to_string(), trace_id.clone());
-                session.opened(&trace_id, agent_id, true);
+                session.opened(&trace_id, agent_id);
                 out.push(SpanUpdate {
                     parent_id: Some(spawned_by.as_ref().map_or(MAIN, |p| p.tool_use_id.as_str()).to_string()),
                     kind: Some(Kind::Agent),
@@ -308,7 +318,7 @@ impl ClaudeCode {
 fn begin(session: &mut Session, trace_id: String, prompt: Option<&str>, ev: &Value, now: f64) -> Vec<SpanUpdate> {
     session.trace_id = Some(trace_id.clone());
     session.pending_agents.clear();
-    session.opened(&trace_id, MAIN, false);
+    session.opened(&trace_id, MAIN);
     let mut attrs = Map::new();
     attrs.insert("source".into(), "claude-code".into());
     for k in ["session_id", "cwd", "permission_mode", "transcript_path"] {
@@ -548,6 +558,35 @@ mod tests {
         assert_eq!((reply.kind, reply.parent_id.as_deref(), reply.agent.as_deref()), (Kind::Message, Some("msg_02"), Some("claude-code")));
         assert_eq!(by("msg_01:r0").kind, Kind::Reasoning);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_prompt_sent_mid_turn_does_not_fail_the_running_turn() {
+        let store = Store::in_memory();
+        let cc = ClaudeCode::default();
+        let send = |ev: Value, t: f64| store.ingest(cc.handle(&ev, t, |id| store.has_trace(id)), t).unwrap();
+        let ev = |p: &str, name: &str, extra: Value| {
+            let mut e = serde_json::json!({"session_id": "s", "prompt_id": p, "hook_event_name": name});
+            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            e
+        };
+        send(ev("p1", "UserPromptSubmit", serde_json::json!({"prompt": "build it"})), 1.0);
+        send(ev("p1", "PreToolUse", serde_json::json!({"tool_name": "Bash", "tool_use_id": "t1"})), 2.0);
+        // The user types while the Bash call runs; Claude Code takes the message and keeps going.
+        send(ev("p2", "UserPromptSubmit", serde_json::json!({"prompt": "also run the tests"})), 3.0);
+        send(ev("p2", "PostToolUse", serde_json::json!({"tool_name": "Bash", "tool_use_id": "t1"})), 4.0);
+        send(ev("p2", "Stop", serde_json::json!({"last_assistant_message": "done"})), 5.0);
+
+        let p1 = store.trace("p1").unwrap();
+        let by = |id: &str| p1.iter().find(|s| s.span_id == id).unwrap_or_else(|| panic!("no span {id}"));
+        let main = by(MAIN);
+        assert_eq!((main.status, main.error.as_deref(), main.end), (Status::Ok, None, Some(3.0)));
+        assert_eq!(main.attrs.get("ended_by"), Some(&Value::from("next prompt")));
+        let bash = by("t1");
+        assert_eq!((bash.status, bash.end), (Status::Ok, Some(4.0)), "the tool finishes in the turn it started in");
+        let p2 = store.trace("p2").unwrap();
+        assert!(p2.iter().all(|s| s.span_id != "t1"));
+        assert_eq!(p2.iter().find(|s| s.span_id == MAIN).unwrap().status, Status::Ok);
     }
 
     #[test]
