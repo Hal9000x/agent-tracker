@@ -121,9 +121,10 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn detects_a_running_tracker_and_nothing_else() {
+    /// A tracker on a free port.
+    async fn serve() -> (u16, Arc<api::App>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = Arc::new(api::App {
@@ -132,7 +133,59 @@ mod tests {
             codex: codex::Codex::new(None),
             bind_host: "127.0.0.1".into(),
         });
-        tokio::spawn(async move { axum::serve(listener, api::router(app)).await });
+        let router = api::router(app.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        (port, app)
+    }
+
+    /// The shells Codex may run a hook command in: PowerShell on Windows (where a bare `@-` doesn't parse), else sh.
+    fn shells(command: &str) -> Vec<Command> {
+        if cfg!(windows) {
+            let mut powershell = Command::new("powershell.exe");
+            powershell.args(["-NoProfile", "-Command", command]);
+            let mut cmd = Command::new("cmd.exe");
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::raw_arg(&mut cmd, format!("/C {command}"));
+            vec![powershell, cmd]
+        } else {
+            let mut sh = Command::new("sh");
+            sh.args(["-c", command]);
+            vec![sh]
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shipped_codex_hooks_deliver_events_from_every_shell() {
+        let (port, app) = serve().await;
+        let hooks: serde_json::Value = serde_json::from_str(include_str!("../../integrations/codex/hooks.json")).unwrap();
+        let key = if cfg!(windows) { "commandWindows" } else { "command" };
+        let mut commands: Vec<String> = hooks["hooks"].as_object().unwrap().values().flat_map(|groups| groups.as_array().unwrap())
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .map(|handler| handler[key].as_str().unwrap().replace(":4318/", &format!(":{port}/")))
+            .collect();
+        commands.dedup();
+        assert_eq!(commands.len(), 1, "every event uses the same command");
+
+        for (i, mut shell) in shells(&commands[0]).into_iter().enumerate() {
+            let turn = format!("turn-{i}");
+            let event = serde_json::json!({"session_id": "s", "turn_id": turn, "hook_event_name": "UserPromptSubmit", "prompt": "hi"});
+            let out = tokio::task::spawn_blocking(move || {
+                let mut child = shell.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+                child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+                child.wait_with_output().unwrap()
+            })
+            .await
+            .unwrap();
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success(), "shell {i} failed: {stderr}");
+            assert_eq!(stdout.trim(), "{}", "Codex parses the hook's stdout as its answer");
+            assert!(app.store.has_trace(&turn), "shell {i} delivered no event");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detects_a_running_tracker_and_nothing_else() {
+        let (port, _app) = serve().await;
         assert!(tokio::task::spawn_blocking(move || tracker_running("127.0.0.1", port)).await.unwrap());
 
         let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
