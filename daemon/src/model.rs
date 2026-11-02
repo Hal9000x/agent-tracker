@@ -13,6 +13,8 @@ pub enum Kind {
     Split,
     Fork,
     Join,
+    /// A model's thinking or reasoning summary, as a child of its llm span.
+    Reasoning,
     #[serde(other)]
     Step,
 }
@@ -27,6 +29,7 @@ impl Kind {
             Kind::Split => "split",
             Kind::Fork => "fork",
             Kind::Join => "join",
+            Kind::Reasoning => "reasoning",
             Kind::Step => "step",
         }
     }
@@ -285,6 +288,8 @@ mod tests {
     fn unknown_kind_becomes_step() {
         let u: SpanUpdate = serde_json::from_str(r#"{"trace_id":"t","span_id":"s","kind":"retrieval"}"#).unwrap();
         assert_eq!(u.kind, Some(Kind::Step));
+        let u: SpanUpdate = serde_json::from_str(r#"{"trace_id":"t","span_id":"s","kind":"reasoning"}"#).unwrap();
+        assert_eq!(u.kind, Some(Kind::Reasoning));
     }
 
     #[test]

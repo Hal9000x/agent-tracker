@@ -1,6 +1,6 @@
 // Pure data logic shared by both views: span tree, flow graph, filters, formatting.
 
-export type Kind = "message" | "agent" | "llm" | "tool" | "split" | "fork" | "join" | "step";
+export type Kind = "message" | "agent" | "llm" | "tool" | "split" | "fork" | "join" | "reasoning" | "step";
 export type Status = "running" | "ok" | "error";
 
 export interface Span {
@@ -46,6 +46,7 @@ export const KIND_COLOR: Record<Kind, string> = {
   split: "#fcad70",
   fork: "#ff8bcb",
   join: "#78d9ec",
+  reasoning: "#a8a2ff",
   step: "#9aa0a6",
 };
 
@@ -53,6 +54,7 @@ export const KIND_GROUPS: { id: string; label: string; kinds: Kind[] }[] = [
   { id: "message", label: "Msg", kinds: ["message"] },
   { id: "agent", label: "Agent", kinds: ["agent"] },
   { id: "llm", label: "LLM", kinds: ["llm"] },
+  { id: "reasoning", label: "Reasoning", kinds: ["reasoning"] },
   { id: "tool", label: "Tool", kinds: ["tool"] },
   { id: "flow", label: "Split/Fork", kinds: ["split", "fork", "join"] },
   { id: "other", label: "Other", kinds: ["step"] },

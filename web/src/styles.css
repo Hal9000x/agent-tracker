@@ -82,6 +82,7 @@ input.filter:focus {
 .kind-split { --c: #fcad70; }
 .kind-fork { --c: #ff8bcb; }
 .kind-join { --c: #78d9ec; }
+.kind-reasoning { --c: #a8a2ff; }
 .kind-step { --c: #9aa0a6; }
 
 .kind-icon {

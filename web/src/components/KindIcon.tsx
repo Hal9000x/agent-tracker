@@ -8,6 +8,7 @@ const PATHS: Record<Kind, { d: string; fill?: boolean }> = {
   split: { d: "M1 6h3.5M4.5 6 10 2M4.5 6H10M4.5 6 10 10" },
   fork: { d: "M1 6h3.5M4.5 6 10 2.5M4.5 6 10 9.5" },
   join: { d: "M2 2l4.5 4M2 10l4.5-4M6.5 6H11" },
+  reasoning: { d: "M3.2 7.6a2 2 0 0 1 .3-3.9 2.6 2.6 0 0 1 4.9-.4 1.9 1.9 0 0 1 .9 3.6 1.7 1.7 0 0 1-1.6.7H4.2M2.6 9.8h.1M1.4 11h.1" },
   step: { d: "M6 3.5a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5", fill: true },
 };
 

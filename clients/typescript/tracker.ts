@@ -14,7 +14,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes, randomUUID } from "node:crypto";
 
-export type Kind = "message" | "agent" | "llm" | "tool" | "split" | "fork" | "join" | "step";
+export type Kind = "message" | "agent" | "llm" | "tool" | "split" | "fork" | "join" | "reasoning" | "step";
 
 export interface SpanOptions {
   agent?: string;
