@@ -53,14 +53,6 @@ fn needs_sign_in(args: &Args) -> bool {
     args.public_url.is_some() || !loopback
 }
 
-/// A tracker other machines can reach must be told the address they use, so that it knows
-/// its host name and whether passwords and cookies travel over https.
-fn hosting_problem(args: &Args) -> Option<String> {
-    (needs_sign_in(args) && args.public_url.is_none()).then(|| {
-        format!("--host {} lets other machines reach the tracker: also give --public-url, the address they use (https://..., or http://... on a network you trust)", args.host)
-    })
-}
-
 /// The owner's credentials from the environment, and the ingest token from the data folder.
 fn sign_in_from_env(args: &Args) -> auth::Auth {
     let password = std::env::var("AGENT_TRACKER_PASSWORD").unwrap_or_default();
@@ -129,8 +121,7 @@ fn fail(msg: String) -> ! {
 fn tracker_running(host: &str, port: u16) -> bool {
     let Ok(mut conn) = TcpStream::connect((host, port)) else { return false };
     let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
-    // /api/session answers without sign-in, so this also finds a hosted tracker.
-    if conn.write_all(b"GET /api/session HTTP/1.0\r\nHost: localhost\r\n\r\n").is_err() {
+    if conn.write_all(b"GET /api/traces HTTP/1.0\r\nHost: localhost\r\n\r\n").is_err() {
         return false;
     }
     let mut head = [0u8; 512];
@@ -169,17 +160,8 @@ async fn main() {
         Mode::InstallWeb(url) => Some(setup::install_web(&repo(), url)),
         Mode::UninstallWeb => Some(setup::uninstall_web(&repo())),
     };
-    // These run from a terminal, so a failure needs no "Press Enter" pause.
-    match done {
-        Some(Ok(lines)) => return lines.iter().for_each(|line| println!("{line}")),
-        Some(Err(e)) => {
-            eprintln!("{e}");
-            std::process::exit(1)
-        }
-        None => {}
-    }
-    if let Some(problem) = hosting_problem(&args) {
-        fail(problem);
+    if let Some(done) = done {
+        return done.unwrap_or_else(|e| fail(e.to_string())).iter().for_each(|line| println!("{line}"));
     }
     let browse_host = if args.host == "0.0.0.0" { "127.0.0.1" } else { args.host.as_str() };
     let url = format!("http://{browse_host}:{}", args.port);
@@ -195,16 +177,13 @@ async fn main() {
         }
         Err(e) => fail(format!("cannot listen on {}:{}: {e}", args.host, args.port)),
     };
-    let store = store::Store::open(&args.data).unwrap_or_else(|e| fail(format!("cannot open data dir {}: {e}", args.data.display())));
     let auth = needs_sign_in(&args).then(|| sign_in_from_env(&args));
+    let store = store::Store::open(&args.data).unwrap_or_else(|e| fail(format!("cannot open data dir {}: {e}", args.data.display())));
     let signed_in_as = auth.as_ref().map(|a| a.username().to_string());
-    // A hosted tracker hears from other machines only, so it never opens transcript or
-    // rollout files on its own; cloud hooks send their transcript text along.
-    let hosted = auth.is_some();
     let app = Arc::new(api::App {
         store,
-        claude_code: claude_code::ClaudeCode::new(claude_code::projects_dir().filter(|_| !hosted)),
-        codex: if hosted { codex::Codex::new(None) } else { codex::Codex::default() },
+        claude_code: claude_code::ClaudeCode::new(claude_code::projects_dir()),
+        codex: codex::Codex::default(),
         bind_host: args.host.clone(),
         auth,
     });
@@ -226,8 +205,7 @@ async fn main() {
     if args.open {
         open_browser(&url);
     }
-    // Sign-in counts failures per client address.
-    axum::serve(listener, api::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    axum::serve(listener, api::router(app)).await.unwrap();
 }
 
 #[cfg(test)]
@@ -312,10 +290,6 @@ mod tests {
         assert!(!needs_sign_in(&parse("").unwrap()));
         assert!(!needs_sign_in(&parse("--host ::1").unwrap()));
         assert!(needs_sign_in(&parse("--host 0.0.0.0").unwrap()));
-        // Reachable from elsewhere, it must be told where, and so whether it is behind https.
-        assert!(hosting_problem(&parse("--host 0.0.0.0").unwrap()).is_some());
-        assert!(hosting_problem(&parse("--host 0.0.0.0 --public-url http://10.0.0.5:4318").unwrap()).is_none());
-        assert!(hosting_problem(&parse("").unwrap()).is_none());
         assert!(needs_sign_in(&parse("--public-url https://t.example.org/").unwrap()), "behind a proxy on this machine");
         assert_eq!(parse("--public-url https://t.example.org/").unwrap().public_url.as_deref(), Some("https://t.example.org"));
         assert!(parse("--public-url t.example.org").is_err());

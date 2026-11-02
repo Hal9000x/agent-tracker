@@ -121,9 +121,8 @@ function Snippet({ label, text }: { label?: string; text: string }) {
 
 /** Setup instructions per harness, with whether data from it is arriving. */
 export function ConnectGuide({ traces, session }: { traces: TraceSummary[]; session: Session }) {
-  const harnesses = session.auth
-    ? hostedHarnesses(session.public_url ?? location.origin, session.ingest_token ?? "")
-    : localHarnesses(trackerOrigin());
+  const origin = trackerOrigin();
+  const harnesses = session.auth ? hostedHarnesses(origin, session.ingest_token ?? "") : localHarnesses(origin);
   return (
     <div className="connect">
       {harnesses.map((h) => {

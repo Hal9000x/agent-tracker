@@ -123,8 +123,6 @@ export interface Session {
   auth: boolean;
   signed_in: boolean;
   ingest_token?: string;
-  /** Where hooks reach a hosted tracker, which may differ from the address in the browser. */
-  public_url?: string | null;
 }
 
 /** The session, null until known, and a function that checks it again. */

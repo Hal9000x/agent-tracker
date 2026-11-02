@@ -9,7 +9,7 @@ Data arrives live over Server-Sent Events, so runs appear while they are still g
 
 ## Quick start
 
-Download the build for your system from the repository's Releases page; [TESTERS.md](TESTERS.md) walks through it. To build it yourself instead, you need Rust 1.88+ and Node 22.18+ (Node 24 recommended). One command builds the UI and the server:
+Building requires Rust 1.88+ and Node 22.18+ (Node 24 recommended). One command builds the UI and the server:
 
 ```bash
 npm run build
@@ -20,9 +20,9 @@ That produces a single file, `daemon/target/release/agent-tracker.exe` (`agent-t
 - It starts on http://127.0.0.1:4318 and opens that page in your browser.
 - Click **Play demo runs** (or **▶ Demo** in the top bar) to replay three sample runs live: a single agent with a tool call, a research swarm (split, three parallel researchers, join, a fork into reviewers with a message between them), and a support handoff with a failing tool.
 - Starting it again while it runs just opens the browser on the running copy.
-- Traces are saved in a per-user folder, printed at startup: `%LOCALAPPDATA%\agent-tracker` on Windows, `~/Library/Application Support/agent-tracker` on macOS, `~/.local/share/agent-tracker` on Linux.
+- Traces are saved in a `data` folder next to where it was started.
 
-Flags: `--host` (default `127.0.0.1`), `--port` (default `4318`), `--data` (default: the per-user folder), `--no-open` (don't open a browser), `--public-url` (see [Hosting](#hosting)). `agent-tracker --version` prints the version.
+Flags: `--host` (default `127.0.0.1`), `--port` (default `4318`), `--data` (default `./data`), `--no-open` (don't open a browser).
 
 ## Sending data
 
@@ -30,7 +30,7 @@ There are four ways in. They all produce the same spans.
 
 ### Claude Code
 
-Run `agent-tracker install`. It adds the `http` hooks in [`integrations/claude-code/settings.json`](integrations/claude-code/settings.json) to `~/.claude/settings.json`, keeping your other settings and a backup of the old file (`settings.json.bak-agent-tracker`). It also sets up Codex when `~/.codex` exists. Running it again replaces the hooks (pass `--port` if the tracker isn't on 4318), and `agent-tracker uninstall` takes them out. To scope tracking to one project instead, merge that file into its `.claude/settings.local.json` by hand.
+Merge [`integrations/claude-code/settings.json`](integrations/claude-code/settings.json) into a Claude Code settings file (`~/.claude/settings.json` for every project, or `.claude/settings.local.json` for one). It adds `http` hooks that post each event to the tracker.
 
 Each prompt you submit becomes one trace: the prompt, the main agent, every tool call, and each subagent nested under the `Agent` tool call that started it. Parallel subagents show up as a fork. If the tracker is not running, Claude Code prints a non-blocking "hook failed" notice and carries on.
 
@@ -40,19 +40,9 @@ A message you send while Claude is still working starts a new trace, and the pre
 
 ### Codex
 
-`agent-tracker install` adds [`integrations/codex/hooks.json`](integrations/codex/hooks.json) to `~/.codex/hooks.json`. Then run `codex`, type `/hooks` and approve the new hooks once: Codex silently skips hooks nobody approved. The hooks pipe each event to the tracker with `curl` (`curl.exe` on Windows, where Codex runs hook commands through PowerShell); with the tracker down, each costs about 0.25 s. For reasoning text, set `model_reasoning_summary = "detailed"` in `~/.codex/config.toml`.
+Save [`integrations/codex/hooks.json`](integrations/codex/hooks.json) as `~/.codex/hooks.json` (merge the event arrays if you already have one). Then run `codex`, type `/hooks` and approve the new hooks once: Codex silently skips hooks nobody approved. The hooks pipe each event to the tracker with `curl` (`curl.exe` on Windows); with the tracker down, each costs about 0.25 s.
 
 Each turn of the Codex CLI or app becomes one trace: the prompt, the main agent, tool calls, and subagents nested under the `spawn_agent` call that started them. Model calls come from the session's rollout file under `~/.codex/sessions`: one `llm` step per response with its token counts, a `reasoning` step per reasoning item and a `message` step per reply. Codex keeps the full reasoning encrypted, so a reasoning step shows the summary Codex writes, or "(reasoning not shown)" when there is none.
-
-### Claude Code on the web
-
-Cloud sessions (claude.ai/code, and the desktop app's cloud sessions) run on Anthropic's machines. They load hooks only from the repository's committed `.claude/settings.json`, and they can reach only domains their environment allows. So they need a [hosted tracker](#hosting), and the tracker can't read their transcripts. Instead, a hook script ships the transcript text with each event.
-
-1. In the repository, run `agent-tracker install-web https://tracker.example.com`. It adds command hooks to `.claude/settings.json` and writes [`.claude/agent-tracker-hook.mjs`](integrations/claude-code-web/agent-tracker-hook.mjs) beside it. Commit both and push. The script does nothing in local sessions (`CLAUDE_CODE_REMOTE` isn't set there), so local tracking isn't doubled.
-2. In the claude.ai/code environment's settings, set **Network access** to **Custom** and add the tracker's domain to **Allowed domains**.
-3. In the same environment, add a **network secret** for that domain: type Bearer, header `Authorization`, value the ingest token from the hosted tracker's Connect panel. The proxy adds it on the way out, so the token never sits in the repository or the session. Without network secrets, set `AGENT_TRACKER_TOKEN` in the environment's variables instead; anyone who can use the environment can read those.
-
-`agent-tracker uninstall-web` takes the hooks and script out again. claude.ai chat and the desktop app's Chat tab have no hooks and can't be tracked.
 
 ### OpenTelemetry
 
@@ -123,26 +113,7 @@ See [`clients/python/examples/demo.py`](clients/python/examples/demo.py) for a s
 | `attrs` | object | merged key by key |
 | `links` | string[] | span ids this span received output from; drawn as dashed message edges |
 
-Other endpoints: `GET /api/traces`, `GET /api/traces/{id}`, `DELETE /api/traces/{id}`, `GET /api/stream` (SSE), `POST /v1/traces` (OTLP), `POST /api/hooks/claude-code`, `POST /api/hooks/codex`, `POST /api/demo` (replays the demo runs), and for [hosting](#hosting) `POST /api/login`, `POST /api/logout`, `GET /api/session`.
-
-## Hosting
-
-A hosted tracker is this same program, run on a server you control so that cloud sessions can reach it. Start it with `--public-url`, the address people and hooks use. That turns on sign-in. A `--host` other than this machine also requires `--public-url`.
-
-- **Signing in:** the owner signs in with `AGENT_TRACKER_USERNAME` (default `admin`) and `AGENT_TRACKER_PASSWORD` (12+ characters), both read from the environment. It refuses to start without a password. Sessions last 30 days. After ten failed sign-ins in a minute, that client is refused for the rest of the minute; others aren't. Behind a proxy on the same machine or a private network, the client is the address the proxy puts last in `X-Forwarded-For`.
-- **Sending data:** hooks, `/api/spans` and `/v1/traces` need `Authorization: Bearer <ingest token>`. The token is made on first start, kept in `<data>/ingest-token`, and shown in the Connect panel once you're signed in. To replace it, delete that file and restart. A network secret adds the token to every request the cloud session makes to your tracker's domain. So anything running in that session can add data, though only the owner can read it.
-- **HTTPS:** the program speaks plain HTTP, so put HTTPS in front of it. Use a reverse proxy, for example `caddy reverse-proxy --from tracker.example.com --to 127.0.0.1:4318`, or your platform's. `install-web` accepts only https addresses.
-- A hosted tracker answers only to its public host name and the local names, and it never opens transcript files on the server it runs on.
-
-With Docker ([`Dockerfile`](Dockerfile)):
-
-```bash
-docker build -t agent-tracker .
-docker run -d -p 127.0.0.1:4318:4318 -v agent-tracker-data:/data \
-  -e AGENT_TRACKER_PASSWORD='choose 12+ characters' agent-tracker --public-url https://tracker.example.com
-```
-
-Without Docker, run the Linux build with the same flags (`--host 127.0.0.1 --public-url https://...` behind a proxy on the same machine).
+Other endpoints: `GET /api/traces`, `GET /api/traces/{id}`, `DELETE /api/traces/{id}`, `GET /api/stream` (SSE), `POST /v1/traces` (OTLP), `POST /api/hooks/claude-code`, `POST /api/hooks/codex`, `POST /api/demo` (replays the demo runs).
 
 ## Using the views
 
@@ -155,15 +126,13 @@ Without Docker, run the Linux build with the same flags (`--host 127.0.0.1 --pub
 ## Layout
 
 ```
-daemon/        Rust server (axum): ingest, store, SSE, OTLP, Claude Code and Codex adapters, sign-in, hook install, embedded UI
+daemon/        Rust server (axum): ingest, store, SSE, OTLP and Claude Code adapters, embedded UI
 web/           React + TypeScript UI (Vite, React Flow, dagre)
 clients/       TypeScript and Python clients, with demos
-integrations/  Hook settings for Claude Code, Codex and Claude Code on the web
+integrations/  Claude Code hook settings
 ```
 
-Spans live in memory and are appended to `spans.jsonl` in the data folder. The log is replayed on startup.
-
-Pushing a `v*` tag runs [the release workflow](.github/workflows/release.yml): it tests and builds on Windows, macOS (one binary for Apple silicon and Intel) and Linux (statically linked), and publishes a pre-release with [TESTERS.md](TESTERS.md) in each download.
+Spans live in memory and are appended to `data/spans.jsonl`. The log is replayed on startup.
 
 ## Development
 
@@ -183,7 +152,7 @@ For UI work, run the daemon, then `npm run dev` in `web/`. Vite proxies `/api` a
 
 ## Limits
 
-- A tracker on your machine has no sign-in; it binds to `127.0.0.1` by default. To keep web pages you visit from reaching it, it refuses requests that name a foreign `Host` (DNS rebinding) and writes that aren't `application/json` or `application/x-protobuf` (cross-site form posts). A [hosted](#hosting) tracker has one owner account; there are no per-user accounts.
+- No authentication. The daemon binds to `127.0.0.1` by default; only expose it on a trusted network. To keep web pages you visit from reaching it, it refuses requests that name a foreign `Host` (DNS rebinding) and writes that aren't `application/json` or `application/x-protobuf` (cross-site form posts).
 - No automatic retention. Delete traces from the list; a deleted trace stays in `data/spans.jsonl` (with a tombstone) until you remove the file.
 - Prompts, tool inputs and outputs, reasoning and replies are stored in plain text in `data/spans.jsonl`. They never leave your machine, but treat the file as you would the transcripts themselves.
 - Claude Code transcripts and Codex rollout files are undocumented formats. The readers skip what they don't recognize, so a format change loses model calls rather than breaking tracking.

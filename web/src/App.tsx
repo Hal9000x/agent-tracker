@@ -44,7 +44,6 @@ function SignIn({ onSignedIn }: { onSignedIn: () => void }) {
   const submit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
-    setError(null);
     setBusy(true);
     signIn(String(form.get("username")), String(form.get("password"))).then((err) => {
       setBusy(false);

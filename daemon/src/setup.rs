@@ -44,12 +44,11 @@ const WEB_MARKER: &str = "agent-tracker-hook.mjs";
 /// Sets up a repository so its Claude Code on the web sessions report to the tracker at `url`:
 /// adds the hooks to its committed `.claude/settings.json` and writes the hook script beside it.
 pub fn install_web(repo: &Path, url: &str) -> io::Result<Vec<String>> {
-    // The address ends up in a shell command, so only plain web addresses get in; and the
-    // hooks carry prompts and the ingest token across the internet, so only over https.
+    // The address ends up in a shell command, so only plain web addresses get in.
     let plain = url.chars().all(|c| c.is_ascii_alphanumeric() || "-._~:/".contains(c));
-    let host = url.strip_prefix("https://").filter(|_| plain).and_then(|rest| rest.split(['/', ':']).next());
+    let host = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).filter(|_| plain).and_then(|rest| rest.split(['/', ':']).next());
     let Some(host) = host.filter(|h| !h.is_empty()) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{url} is not a plain https address, like https://tracker.example.com")));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{url} is not a plain http(s) address, like https://tracker.example.com")));
     };
     let dir = repo.join(".claude");
     fs::create_dir_all(&dir)?;
@@ -273,8 +272,7 @@ mod tests {
     #[test]
     fn install_web_takes_only_plain_web_addresses() {
         let repo = scratch_home("web-url");
-        // Plain http would carry prompts and the ingest token across the internet readable.
-        for url in ["tracker.example.org", "https://x.org/$(id)", "https://x.org\" && rm -rf ~ \"", "https://x.org;id", "ftp://x.org", "http://x.org", "https://"] {
+        for url in ["tracker.example.org", "https://x.org/$(id)", "https://x.org\" && rm -rf ~ \"", "https://x.org;id", "ftp://x.org"] {
             assert!(install_web(&repo, url).is_err(), "{url}");
         }
         assert!(!repo.join(".claude").exists());

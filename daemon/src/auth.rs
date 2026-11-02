@@ -14,8 +14,7 @@ use axum::http::{HeaderMap, header};
 
 const COOKIE: &str = "agent_tracker_session";
 const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// After this many failed sign-ins from one client within the window, that client is
-/// refused until its oldest failure leaves the window. Others sign in as usual.
+/// After this many failed sign-ins within the window, sign-in is refused until the oldest leaves it.
 const MAX_FAILURES: usize = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -23,14 +22,12 @@ pub struct Auth {
     username: String,
     password: String,
     ingest_token: String,
-    /// --public-url, where hooks reach this tracker.
-    public_url: Option<String>,
-    /// Its host name, served besides the local names.
+    /// The host name of --public-url, served besides the local names.
     public_host: Option<String>,
+    secure_cookie: bool,
     /// Signed-in session ids and when they expire.
     sessions: Mutex<HashMap<String, Instant>>,
-    /// Recent failed sign-ins by client address.
-    failures: Mutex<HashMap<String, VecDeque<Instant>>>,
+    failures: Mutex<VecDeque<Instant>>,
 }
 
 pub enum SignIn {
@@ -48,14 +45,10 @@ impl Auth {
             password,
             ingest_token,
             public_host: host.filter(|h| !h.is_empty()).map(str::to_ascii_lowercase),
-            public_url: public_url.map(str::to_string),
+            secure_cookie: public_url.is_some_and(|u| u.starts_with("https://")),
             sessions: Mutex::default(),
             failures: Mutex::default(),
         }
-    }
-
-    pub fn public_url(&self) -> Option<&str> {
-        self.public_url.as_deref()
     }
 
     pub fn public_host(&self) -> Option<&str> {
@@ -84,22 +77,18 @@ impl Auth {
         sessions.contains_key(id)
     }
 
-    /// `client` is the address the attempt came from (see `api::client_address`).
-    pub fn sign_in(&self, client: &str, username: &str, password: &str) -> SignIn {
+    pub fn sign_in(&self, username: &str, password: &str) -> SignIn {
         let mut failures = self.failures.lock().unwrap();
         let now = Instant::now();
-        for times in failures.values_mut() {
-            while times.front().is_some_and(|t| now.duration_since(*t) >= FAILURE_WINDOW) {
-                times.pop_front();
-            }
+        while failures.front().is_some_and(|t| now.duration_since(*t) >= FAILURE_WINDOW) {
+            failures.pop_front();
         }
-        failures.retain(|_, times| !times.is_empty());
-        if failures.get(client).is_some_and(|times| times.len() >= MAX_FAILURES) {
+        if failures.len() >= MAX_FAILURES {
             return SignIn::Locked;
         }
         // Both are compared in full, so the time taken doesn't tell which one was wrong.
         if !(same(username.as_bytes(), self.username.as_bytes()) & same(password.as_bytes(), self.password.as_bytes())) {
-            failures.entry(client.to_string()).or_default().push_back(now);
+            failures.push_back(now);
             return SignIn::Wrong;
         }
         let id = random_hex(32);
@@ -116,7 +105,7 @@ impl Auth {
     }
 
     fn cookie(&self, value: &str, max_age: Duration) -> String {
-        let secure = if self.public_url().is_some_and(|u| u.starts_with("https://")) { "; Secure" } else { "" };
+        let secure = if self.secure_cookie { "; Secure" } else { "" };
         format!("{COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}", max_age.as_secs())
     }
 }
