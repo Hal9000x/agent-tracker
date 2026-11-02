@@ -159,7 +159,14 @@ impl ClaudeCode {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.entry(session_id.to_string()).or_default();
         let mut out = match &self.projects {
-            Some(projects) => read_transcripts(projects, session, ev),
+            Some(projects) => {
+                // Turns the tracker never saw (it started mid-session) or that were
+                // deleted stay out, rather than coming back as traces of bare model calls.
+                let current: Vec<String> = [s("prompt_id"), session.trace_id.as_deref()].into_iter().flatten().map(str::to_string).collect();
+                let mut calls = read_transcripts(projects, session, ev);
+                calls.retain(|u| known(&u.trace_id) || current.contains(&u.trace_id));
+                calls
+            }
             None => Vec::new(),
         };
 
@@ -522,12 +529,17 @@ mod tests {
         send(event(&path, "UserPromptSubmit", serde_json::json!({"prompt": "Find the launch code"})), t0);
         assert_eq!(llm_spans(&store, "p1"), [("msg_01".into(), MAIN.into(), Some(t0 + 3000.0))]);
 
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(&TRANSCRIPT.as_bytes()[cut..]).unwrap();
+        let append = |from: usize, to: usize| OpenOptions::new().append(true).open(&path).unwrap().write_all(&TRANSCRIPT.as_bytes()[from..to]).unwrap();
+        // The second turn starts at its user record; until its prompt event arrives it isn't written.
+        let turn2 = TRANSCRIPT[..TRANSCRIPT.find(r#""p2""#).unwrap()].rfind('\n').unwrap() + 1;
+        append(cut, turn2);
         send(event(&path, "Stop", serde_json::json!({"last_assistant_message": "The launch code is 42."})), t0 + 10_100.0);
         let spans = llm_spans(&store, "p1");
         assert_eq!(spans.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["msg_01", "msg_02"]);
         assert_eq!(spans[1], ("msg_02".into(), MAIN.into(), Some(t0 + 10_000.0)));
         // The next turn's call lands in that turn's trace.
+        append(turn2, TRANSCRIPT.len());
+        send(event(&path, "UserPromptSubmit", serde_json::json!({"prompt_id": "p2", "prompt": "And the files?"})), t0 + 60_000.0);
         assert_eq!(llm_spans(&store, "p2"), [("msg_03".into(), MAIN.into(), Some(t0 + 62_000.0))]);
         let p1 = store.trace("p1").unwrap();
         let by = |id: &str| p1.iter().find(|s| s.span_id == id).unwrap_or_else(|| panic!("no span {id}"));
@@ -535,6 +547,21 @@ mod tests {
         let reply = by("msg_02:m0");
         assert_eq!((reply.kind, reply.parent_id.as_deref(), reply.agent.as_deref()), (Kind::Message, Some("msg_02"), Some("claude-code")));
         assert_eq!(by("msg_01:r0").kind, Kind::Reasoning);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn starting_mid_session_skips_turns_the_tracker_never_saw() {
+        let base = scratch("midsession");
+        let path = base.join("projects/proj/sess-t.jsonl");
+        fs::write(&path, TRANSCRIPT).unwrap();
+        let store = Store::in_memory();
+        let cc = ClaudeCode::new(Some(base.join("projects")));
+        // The first event the tracker sees is from the session's second turn.
+        let ev = event(&path, "PreToolUse", serde_json::json!({"prompt_id": "p2", "tool_name": "Bash", "tool_use_id": "t9"}));
+        store.ingest(cc.handle(&ev, 1.0, |id| store.has_trace(id)), 1.0).unwrap();
+        assert!(store.trace("p1").is_none(), "an earlier turn stays out instead of becoming a trace of bare model calls");
+        assert_eq!(llm_spans(&store, "p2").len(), 1, "the current turn's calls are kept");
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -587,7 +614,8 @@ mod tests {
             assert_eq!(span_ids(i, path.clone()), [PROMPT, MAIN], "{}", path.display());
         }
         let read = span_ids(99, projects.join("proj/sess-t.jsonl"));
-        assert_eq!(read.iter().filter(|id| id.starts_with("msg_") && !id.contains(':')).count(), 3, "{read:?}");
+        // The event's turn is p1, so only p1's two calls; p2 is a turn the tracker hasn't seen.
+        assert_eq!(read.iter().filter(|id| id.starts_with("msg_") && !id.contains(':')).count(), 2, "{read:?}");
         fs::remove_dir_all(&base).unwrap();
     }
 
