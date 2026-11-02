@@ -1226,6 +1226,70 @@ main {
   border: 1px solid var(--border);
 }
 
+.snippet-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-2);
+}
+
+.snippet-label + .copy {
+  top: 24px;
+}
+
+.connect .steps {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+
+.connect .steps li {
+  margin: 3px 0;
+}
+
+.sign-in {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.sign-in form {
+  width: min(320px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 24px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.sign-in .brand {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.sign-in label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-2);
+}
+
+.sign-in input {
+  padding: 6px 8px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+}
+
+.sign-in input:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
 .onboarding h2 {
   margin: 0 0 6px;
   font-size: 18px;

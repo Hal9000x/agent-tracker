@@ -67,7 +67,12 @@ impl Store {
     /// Replays `dir/spans.jsonl` and appends new updates to it. Unreadable lines
     /// (a torn last line after a crash) are skipped and counted.
     pub fn open(dir: &Path) -> io::Result<Store> {
-        fs::create_dir_all(dir)?;
+        // Traces hold prompts and reasoning: a new folder is the user's alone.
+        let mut folder = fs::DirBuilder::new();
+        folder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut folder, 0o700);
+        folder.create(dir)?;
         let path = dir.join("spans.jsonl");
         let mut state = State::default();
         let mut skipped = 0;
@@ -213,6 +218,17 @@ mod tests {
         assert_eq!(live.traces(), replayed.traces());
         // The agent had no start; it took the receive time of its first update.
         assert_eq!(replayed.trace("t1").unwrap()[0].start, 0.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Traces hold prompts and reasoning, so other users on the machine can't open the folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_data_folder_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("private");
+        Store::open(&dir).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         fs::remove_dir_all(&dir).unwrap();
     }
 

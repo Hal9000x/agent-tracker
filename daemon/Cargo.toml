@@ -1,16 +1,17 @@
 [package]
 name = "agent-tracker"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
+getrandom = "0.3"
 mime_guess = "2.0.5"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["trace", "gen-tonic-messages", "with-serde"] }
 prost = "0.14.4"
 rust-embed = "8.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.154", features = ["unbounded_depth"] }
+serde_json = { version = "1.0.154", features = ["preserve_order", "unbounded_depth"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 

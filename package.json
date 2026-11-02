@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "build": "npm --prefix web ci && npm --prefix web run build && cargo build --release --manifest-path daemon/Cargo.toml",
-    "test": "cargo test --manifest-path daemon/Cargo.toml && npm --prefix web test && node --test clients/typescript/tracker.test.ts"
+    "test": "cargo test --manifest-path daemon/Cargo.toml && npm --prefix web test && node --test clients/typescript/tracker.test.ts integrations/claude-code-web/agent-tracker-hook.test.mjs"
   }
 }

@@ -1,9 +1,10 @@
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -17,6 +18,7 @@ use serde_json::Value;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
+use crate::auth::{Auth, SignIn};
 use crate::claude_code::ClaudeCode;
 use crate::codex::Codex;
 use crate::demo;
@@ -30,6 +32,8 @@ pub struct App {
     pub codex: Codex,
     /// The --host address; requests naming any other host are refused.
     pub bind_host: String,
+    /// Set when the tracker is reachable from the internet; None serves anyone who can reach it.
+    pub auth: Option<Auth>,
 }
 
 #[derive(Embed)]
@@ -37,34 +41,118 @@ pub struct App {
 struct Assets;
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
+    let ingest = Router::new()
         .route("/api/spans", post(ingest_spans))
+        .route("/api/hooks/claude-code", post(claude_code_hook))
+        .route("/api/hooks/codex", post(codex_hook))
+        .route("/v1/traces", post(otlp_traces))
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_token));
+    let owner = Router::new()
         .route("/api/traces", get(list_traces))
         .route("/api/traces/{id}", get(get_trace).delete(delete_trace))
         .route("/api/stream", get(stream))
-        .route("/api/hooks/claude-code", post(claude_code_hook))
-        .route("/api/hooks/codex", post(codex_hook))
         .route("/api/demo", post(play_demo))
-        .route("/v1/traces", post(otlp_traces))
+        .route("/api/logout", post(logout))
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_sign_in));
+    Router::new()
+        .merge(ingest)
+        .merge(owner)
+        .route("/api/login", post(login))
+        .route("/api/session", get(session))
         .fallback(static_files)
         .layer(DefaultBodyLimit::max(64 << 20))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
 }
 
-/// The server has no auth, so keep web pages out: a foreign Host header means
-/// DNS rebinding, and writes must use a content type that a browser cannot send
-/// cross-site without a CORS preflight (which this server never answers).
+/// Keeps web pages out: a foreign Host header means DNS rebinding, and writes must
+/// use a content type that a browser cannot send cross-site without a CORS preflight
+/// (which this server never answers).
 async fn guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
-    match refusal(&app.bind_host, &req) {
+    let public_host = app.auth.as_ref().and_then(Auth::public_host);
+    match refusal(&app.bind_host, public_host, &req) {
         Some(refused) => refused.into_response(),
         None => next.run(req).await,
     }
 }
 
-fn refusal(bind_host: &str, req: &Request) -> Option<(StatusCode, &'static str)> {
+async fn require_token(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    match &app.auth {
+        Some(auth) if !auth.has_token(req.headers()) => (StatusCode::UNAUTHORIZED, "send the ingest token as Authorization: Bearer <token>").into_response(),
+        _ => next.run(req).await,
+    }
+}
+
+async fn require_sign_in(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    match &app.auth {
+        Some(auth) if !auth.signed_in(req.headers()) => (StatusCode::UNAUTHORIZED, "sign in first").into_response(),
+        _ => next.run(req).await,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Credentials {
+    username: String,
+    password: String,
+}
+
+/// Who is signing in, for counting failures: the peer's address or, when the peer is a proxy
+/// on this machine or a private network, the client address that proxy appended to
+/// X-Forwarded-For. Entries before the last one come from the client, so they're ignored.
+fn client_address(peer: Option<IpAddr>, headers: &HeaderMap) -> String {
+    let private = |ip: IpAddr| match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[0] & 0xfe00 == 0xfc00,
+    };
+    let forwarded = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|v| v.rsplit(',').next()).map(str::trim);
+    match (peer, forwarded.filter(|f| !f.is_empty())) {
+        (Some(ip), Some(client)) if private(ip) => client.to_string(),
+        (Some(ip), _) => ip.to_string(),
+        (None, client) => client.unwrap_or("unknown").to_string(),
+    }
+}
+
+/// Sign-in is open to anyone, so it reads only a small body.
+const SIGN_IN_BODY_LIMIT: usize = 4096;
+
+async fn login(State(app): State<Arc<App>>, req: Request) -> Response {
+    let Some(auth) = &app.auth else { return StatusCode::NO_CONTENT.into_response() };
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+    let client = client_address(peer, req.headers());
+    let Ok(body) = axum::body::to_bytes(req.into_body(), SIGN_IN_BODY_LIMIT).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "sign-in body too large").into_response();
+    };
+    let Ok(c) = serde_json::from_slice::<Credentials>(&body) else {
+        return (StatusCode::BAD_REQUEST, "send {\"username\": ..., \"password\": ...}").into_response();
+    };
+    match auth.sign_in(&client, &c.username, &c.password) {
+        SignIn::Accepted(cookie) => (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response(),
+        SignIn::Wrong => (StatusCode::UNAUTHORIZED, "wrong username or password").into_response(),
+        SignIn::Locked => (StatusCode::TOO_MANY_REQUESTS, "too many failed sign-ins; try again in a minute").into_response(),
+    }
+}
+
+async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    match &app.auth {
+        Some(auth) => (StatusCode::NO_CONTENT, [(header::SET_COOKIE, auth.sign_out(&headers))]).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// Whether sign-in is needed and done; a signed-in owner also gets what setting up hooks takes.
+async fn session(State(app): State<Arc<App>>, headers: HeaderMap) -> Json<Value> {
+    Json(match &app.auth {
+        None => serde_json::json!({"auth": false, "signed_in": true}),
+        Some(auth) if auth.signed_in(&headers) => {
+            serde_json::json!({"auth": true, "signed_in": true, "ingest_token": auth.ingest_token(), "public_url": auth.public_url()})
+        }
+        Some(_) => serde_json::json!({"auth": true, "signed_in": false}),
+    })
+}
+
+fn refusal(bind_host: &str, public_host: Option<&str>, req: &Request) -> Option<(StatusCode, &'static str)> {
     let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
-    if !host_allowed(bind_host, header(header::HOST)) {
+    if !host_allowed(bind_host, public_host, header(header::HOST)) {
         return Some((StatusCode::FORBIDDEN, "unexpected Host header"));
     }
     let essence = header(header::CONTENT_TYPE).split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
@@ -74,15 +162,16 @@ fn refusal(bind_host: &str, req: &Request) -> Option<(StatusCode, &'static str)>
     None
 }
 
-fn host_allowed(bind_host: &str, host: &str) -> bool {
-    if host.is_empty() || matches!(bind_host, "0.0.0.0" | "::" | "[::]") {
+/// Bound to every address, any host name is fine, unless a public URL says which one to expect.
+fn host_allowed(bind_host: &str, public_host: Option<&str>, host: &str) -> bool {
+    if host.is_empty() || (public_host.is_none() && matches!(bind_host, "0.0.0.0" | "::" | "[::]")) {
         return true;
     }
     let name = match host.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or_default(),
         None => host.rsplit_once(':').map_or(host, |(name, _)| name),
     };
-    matches!(name, "localhost" | "127.0.0.1" | "::1") || name == bind_host.trim_matches(['[', ']'])
+    matches!(name, "localhost" | "127.0.0.1" | "::1") || name == bind_host.trim_matches(['[', ']']) || public_host.is_some_and(|p| name.eq_ignore_ascii_case(p))
 }
 
 type ApiError = (StatusCode, String);
@@ -212,7 +301,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> Router {
-        router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "127.0.0.1".into() }))
+        router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "127.0.0.1".into(), auth: None }))
     }
 
     async fn send(app: &Router, method: &str, uri: &str, content_type: &str, body: impl Into<Body>) -> (StatusCode, Value) {
@@ -275,7 +364,7 @@ mod tests {
         for ok in ["localhost:4318", "127.0.0.1:4318", "[::1]:4318", "localhost"] {
             assert_eq!(app.clone().oneshot(get(ok)).await.unwrap().status(), StatusCode::OK, "{ok}");
         }
-        let open = router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "0.0.0.0".into() }));
+        let open = router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "0.0.0.0".into(), auth: None }));
         assert_eq!(open.oneshot(get("tracker.lan:4318")).await.unwrap().status(), StatusCode::OK, "--host 0.0.0.0 serves any host");
     }
 
@@ -298,5 +387,126 @@ mod tests {
         assert_eq!((status, body), (StatusCode::OK, serde_json::json!({})));
         let (_, spans) = send(&app, "GET", "/api/traces/turn-1", "", "").await;
         assert_eq!(spans[0]["attrs"]["source"], "codex");
+    }
+
+    const PASSWORD: &str = "correct horse battery";
+
+    /// A tracker served at https://tracker.example.org, owned by "owner", with ingest token "tok-123".
+    fn hosted() -> Router {
+        let auth = Auth::new("owner".into(), PASSWORD.into(), "tok-123".into(), Some("https://tracker.example.org"));
+        router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "127.0.0.1".into(), auth: Some(auth) }))
+    }
+
+    async fn call(app: &Router, method: &str, uri: &str, headers: &[(&str, &str)], body: impl Into<Body>) -> (StatusCode, HeaderMap, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = app.clone().oneshot(req.body(body.into()).unwrap()).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    const HOST: (&str, &str) = ("host", "tracker.example.org");
+    const JSON: (&str, &str) = ("content-type", "application/json");
+
+    async fn sign_in(app: &Router, password: &str) -> (StatusCode, HeaderMap) {
+        let body = serde_json::json!({"username": "owner", "password": password}).to_string();
+        let (status, headers, _) = call(app, "POST", "/api/login", &[HOST, JSON], body).await;
+        (status, headers)
+    }
+
+    #[tokio::test]
+    async fn a_hosted_tracker_serves_its_owner_and_token_holders_only() {
+        let app = hosted();
+        let unauthorized = StatusCode::UNAUTHORIZED;
+        assert_eq!(call(&app, "GET", "/api/traces", &[HOST], "").await.0, unauthorized);
+        assert_ne!(call(&app, "GET", "/", &[HOST], "").await.0, unauthorized, "the sign-in page loads");
+        assert_eq!(call(&app, "GET", "/api/session", &[HOST], "").await.2, serde_json::json!({"auth": true, "signed_in": false}));
+
+        let hook = r#"{"session_id":"s","prompt_id":"p","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+        assert_eq!(call(&app, "POST", "/api/hooks/claude-code", &[HOST, JSON], hook).await.0, unauthorized);
+        assert_eq!(call(&app, "POST", "/api/hooks/claude-code", &[HOST, JSON, ("authorization", "Bearer tok-12")], hook).await.0, unauthorized);
+        assert_eq!(call(&app, "POST", "/api/hooks/claude-code", &[HOST, JSON, ("authorization", "Bearer tok-123")], hook).await.0, StatusCode::OK);
+
+        assert_eq!(sign_in(&app, "correct horse batter").await.0, unauthorized);
+        let (status, headers) = sign_in(&app, PASSWORD).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let cookie = headers["set-cookie"].to_str().unwrap();
+        for attr in ["HttpOnly", "SameSite=Strict", "Secure", "Path=/"] {
+            assert!(cookie.contains(attr), "{cookie}");
+        }
+        let session = cookie.split(';').next().unwrap();
+        let signed_in = [HOST, ("cookie", session)];
+        let (status, _, traces) = call(&app, "GET", "/api/traces", &signed_in, "").await;
+        assert_eq!((status, traces[0]["trace_id"].as_str()), (StatusCode::OK, Some("p")));
+        let expected = serde_json::json!({"auth": true, "signed_in": true, "ingest_token": "tok-123", "public_url": "https://tracker.example.org"});
+        assert_eq!(call(&app, "GET", "/api/session", &signed_in, "").await.2, expected);
+
+        let forged = [HOST, ("cookie", "agent_tracker_session=0123456789abcdef")];
+        assert_eq!(call(&app, "GET", "/api/traces", &forged, "").await.0, unauthorized, "only issued sessions count");
+
+        // A sign-in is not an ingest token, and the token is not a sign-in.
+        let span = r#"{"trace_id":"t","span_id":"a"}"#;
+        assert_eq!(call(&app, "POST", "/api/spans", &[HOST, JSON, ("cookie", session)], span).await.0, unauthorized);
+        assert_eq!(call(&app, "GET", "/api/traces", &[HOST, ("authorization", "Bearer tok-123")], "").await.0, unauthorized);
+
+        call(&app, "POST", "/api/logout", &[HOST, JSON, ("cookie", session)], "{}").await;
+        assert_eq!(call(&app, "GET", "/api/traces", &signed_in, "").await.0, unauthorized, "signed out");
+        assert_eq!(call(&app, "GET", "/api/session", &[("host", "attacker.example")], "").await.0, StatusCode::FORBIDDEN);
+    }
+
+    /// A sign-in attempt arriving from `peer`, carrying `forwarded` as X-Forwarded-For.
+    async fn sign_in_via(app: &Router, peer: [u8; 4], forwarded: &str, password: &str) -> StatusCode {
+        let body = serde_json::json!({"username": "owner", "password": password}).to_string();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header("host", HOST.1)
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", forwarded)
+            .extension(ConnectInfo(std::net::SocketAddr::from((peer, 50_000))))
+            .body(Body::from(body))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn failed_sign_ins_lock_out_only_the_client_making_them() {
+        let app = hosted();
+        let proxy = [127, 0, 0, 1];
+        // A proxy appends the address it saw; whatever the client wrote before it is ignored.
+        for i in 0..10 {
+            assert_eq!(sign_in_via(&app, proxy, &format!("10.9.9.{i}, 198.51.100.7"), "guess").await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(sign_in_via(&app, proxy, "198.51.100.7", PASSWORD).await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(sign_in_via(&app, proxy, "192.0.2.1", PASSWORD).await, StatusCode::NO_CONTENT, "the owner, elsewhere, still signs in");
+
+        // A client reaching the tracker directly is counted by its own address, whatever it claims.
+        let direct = [203, 0, 113, 50];
+        for i in 0..10 {
+            assert_eq!(sign_in_via(&app, direct, &format!("192.0.2.{i}"), "guess").await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(sign_in_via(&app, direct, "192.0.2.99", PASSWORD).await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn sign_in_reads_only_a_small_body() {
+        let big = serde_json::json!({"username": "owner", "password": "x".repeat(10_000)}).to_string();
+        assert_eq!(call(&hosted(), "POST", "/api/login", &[HOST, JSON], big).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_hosted_tracker_on_every_address_still_checks_the_host_name() {
+        let auth = Auth::new("owner".into(), PASSWORD.into(), "tok-123".into(), Some("https://tracker.example.org"));
+        let app = router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "0.0.0.0".into(), auth: Some(auth) }));
+        assert_eq!(call(&app, "GET", "/api/session", &[HOST], "").await.0, StatusCode::OK);
+        assert_eq!(call(&app, "GET", "/api/session", &[("host", "attacker.example")], "").await.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_local_tracker_needs_no_sign_in() {
+        assert_eq!(call(&app(), "GET", "/api/session", &[], "").await.2, serde_json::json!({"auth": false, "signed_in": true}));
     }
 }

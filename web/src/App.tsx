@@ -1,5 +1,5 @@
-import { Component, useEffect, useMemo, useState, type ReactNode } from "react";
-import { deleteTrace, playDemo, useNow, useTracker } from "./api";
+import { Component, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { deleteTrace, playDemo, signIn, signOut, useNow, useSession, useTracker, type Session } from "./api";
 import { ConnectGuide } from "./components/ConnectGuide";
 import { GraphView } from "./components/GraphView";
 import { NetworkView } from "./components/NetworkView";
@@ -32,12 +32,61 @@ function useRoute(): [Route, (r: Route) => void] {
 }
 
 export function App() {
+  const [session, recheck] = useSession();
+  if (!session) return null;
+  if (!session.signed_in) return <SignIn onSignedIn={recheck} />;
+  return <Tracker session={session} recheck={recheck} />;
+}
+
+function SignIn({ onSignedIn }: { onSignedIn: () => void }) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const submit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const form = new FormData(e.currentTarget);
+    setError(null);
+    setBusy(true);
+    signIn(String(form.get("username")), String(form.get("password"))).then((err) => {
+      setBusy(false);
+      if (err) setError(err);
+      else onSignedIn();
+    });
+  };
+  return (
+    <div className="sign-in">
+      <form onSubmit={submit}>
+        <span className="brand">
+          <span className="logo" /> Agent Tracker
+        </span>
+        <label>
+          Username
+          <input name="username" autoComplete="username" required autoFocus />
+        </label>
+        <label>
+          Password
+          <input name="password" type="password" autoComplete="current-password" required />
+        </label>
+        {error && <div className="error-banner">{error}</div>}
+        <button className="primary-btn" disabled={busy}>
+          Sign in
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function Tracker({ session, recheck }: { session: Session; recheck: () => void }) {
   const [route, navigate] = useRoute();
   const [paused, setPaused] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [clip, setClip] = useState<[number, number] | null>(null);
   const [connecting, setConnecting] = useState(false);
   const { traces, spans, conn } = useTracker(route.traceId, paused);
+
+  // A lost connection may be an expired sign-in; checking brings back the sign-in page if so.
+  useEffect(() => {
+    if (conn === "offline" && session.auth) recheck();
+  }, [conn]);
 
   const list = useMemo(() => [...traces.values()].sort((a, b) => b.start - a.start), [traces]);
   const tree = useMemo(() => buildTree(spans.values()), [spans]);
@@ -80,6 +129,11 @@ export function App() {
           <span className="dot" />
           {conn}
         </span>
+        {session.auth && (
+          <button className="tool-btn" title="Sign out of this tracker" onClick={() => signOut().then(recheck)}>
+            Sign out
+          </button>
+        )}
       </header>
       <div className="body">
         <TraceList
@@ -98,7 +152,7 @@ export function App() {
               {route.view === "network" ? <NetworkView {...viewProps} paused={paused} onPause={setPaused} /> : <GraphView {...viewProps} />}
             </ViewBoundary>
           ) : (
-            <EmptyState traces={list} />
+            <EmptyState traces={list} session={session} />
           )}
         </main>
       </div>
@@ -111,7 +165,7 @@ export function App() {
                 ✕
               </button>
             </div>
-            <ConnectGuide traces={list} />
+            <ConnectGuide traces={list} session={session} />
           </div>
         </div>
       )}
@@ -148,7 +202,7 @@ class ViewBoundary extends Component<BoundaryProps, { error: string | null; retr
   }
 }
 
-function EmptyState({ traces }: { traces: TraceSummary[] }) {
+function EmptyState({ traces, session }: { traces: TraceSummary[]; session: Session }) {
   if (traces.length) return <div className="empty center">Select a trace.</div>;
   return (
     <div className="empty center onboarding">
@@ -158,7 +212,7 @@ function EmptyState({ traces }: { traces: TraceSummary[] }) {
         ▶ Play demo runs
       </button>
       <p className="muted">A single agent, a research swarm and a support handoff, replayed in real time.</p>
-      <ConnectGuide traces={traces} />
+      <ConnectGuide traces={traces} session={session} />
     </div>
   );
 }

@@ -118,6 +118,38 @@ export function useTracker(selected: string | null, paused: boolean) {
   return { traces, spans, conn };
 }
 
+/** Whether this tracker needs a sign-in; a signed-in owner also gets the ingest token for hooks. */
+export interface Session {
+  auth: boolean;
+  signed_in: boolean;
+  ingest_token?: string;
+  /** Where hooks reach a hosted tracker, which may differ from the address in the browser. */
+  public_url?: string | null;
+}
+
+/** The session, null until known, and a function that checks it again. */
+export function useSession(): [Session | null, () => void] {
+  const [session, setSession] = useState<Session | null>(null);
+  const [checks, setChecks] = useState(0);
+  useEffect(() => {
+    fetch("/api/session")
+      .then((r) => r.json())
+      .then(setSession)
+      .catch(() => setSession((s) => s ?? { auth: false, signed_in: true }));
+  }, [checks]);
+  return [session, () => setChecks((n) => n + 1)];
+}
+
+/** Resolves to an error message, or null once signed in. */
+export async function signIn(username: string, password: string): Promise<string | null> {
+  const r = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username, password }) });
+  return r.ok ? null : (await r.text()) || `sign-in failed (${r.status})`;
+}
+
+export function signOut(): Promise<void> {
+  return fetch("/api/logout", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }).then(() => {});
+}
+
 /** Permanently removes a trace; every open view drops it via the live stream. */
 export function deleteTrace(id: string): Promise<void> {
   return fetch(`/api/traces/${encodeURIComponent(id)}`, { method: "DELETE" }).then(() => {});

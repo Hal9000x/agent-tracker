@@ -3,7 +3,8 @@
 //! with subagents nested under the Agent tool call that spawned them.
 //! Fields are read leniently because the hook payload schema grows over time.
 //! Model calls come from the session transcript every event names, read up to
-//! its end on each event.
+//! its end on each event, or from the transcript text a cloud session's hook
+//! sends along (integrations/claude-code-web).
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -78,11 +79,24 @@ impl Tail {
             out.extend(self.transcript.feed(&buf[..n]));
         }
     }
+
+    /// Reads text a hook sent from byte `from` of the file, skipping what was already read:
+    /// hooks run concurrently and retry, so the same text can arrive twice.
+    fn feed_sent(&mut self, chunk: &Value) -> Vec<SpanUpdate> {
+        let text = chunk["text"].as_str().unwrap_or_default().as_bytes();
+        let from = chunk["from"].as_u64().unwrap_or(self.offset);
+        let seen = (self.offset.saturating_sub(from) as usize).min(text.len());
+        self.offset = self.offset.max(from).saturating_add((text.len() - seen) as u64);
+        self.transcript.feed(&text[seen..])
+    }
 }
 
 /// Model calls appended to the event's transcripts (the session's, and the
-/// subagent's on a subagent event) since they were last read.
-fn read_transcripts(projects: &Path, session: &mut Session, ev: &Value) -> Vec<SpanUpdate> {
+/// subagent's on a subagent event) since they were last read. A cloud session's
+/// hook sends the appended text itself as `transcript_chunks`, keyed `main` or by
+/// agent id, each `{from, text}` with `from` its byte offset in the file; otherwise
+/// the files are read, if they are under `projects`.
+fn read_transcripts(projects: Option<&Path>, session: &mut Session, ev: &Value) -> Vec<SpanUpdate> {
     let s = |k: &str| ev.get(k).and_then(Value::as_str);
     let Some(main) = s("transcript_path").map(PathBuf::from) else { return Vec::new() };
     let mut files = vec![(MAIN, Some(main_agent(ev)), main.clone())];
@@ -92,10 +106,20 @@ fn read_transcripts(projects: &Path, session: &mut Session, ev: &Value) -> Vec<S
     }
     let mut out = Vec::new();
     for (parent, agent, path) in files {
-        let Some(path) = transcript_file(projects, &path) else { continue };
+        let sent = ev.get("transcript_chunks").and_then(|c| c.get(parent)).filter(|c| c.is_object());
+        let path = match sent {
+            Some(_) => path,
+            None => match projects.and_then(|p| transcript_file(p, &path)) {
+                Some(path) => path,
+                None => continue,
+            },
+        };
         let tail = session.tails.entry(path.clone()).or_insert_with(|| Tail { offset: 0, transcript: Transcript::new(parent, agent) });
-        // A transcript that can't be read only means no model calls this time.
-        let _ = tail.read_new(&path, &mut out);
+        match sent {
+            Some(chunk) => out.extend(tail.feed_sent(chunk)),
+            // A transcript that can't be read only means no model calls this time.
+            None => drop(tail.read_new(&path, &mut out)),
+        }
         // A stopped subagent writes nothing more.
         if parent != MAIN && s("hook_event_name") == Some("SubagentStop") {
             session.tails.remove(&path);
@@ -165,17 +189,11 @@ impl ClaudeCode {
         let event = s("hook_event_name").unwrap_or_default();
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.entry(session_id.to_string()).or_default();
-        let mut out = match &self.projects {
-            Some(projects) => {
-                // Turns the tracker never saw (it started mid-session) or that were
-                // deleted stay out, rather than coming back as traces of bare model calls.
-                let current: Vec<String> = [s("prompt_id"), session.trace_id.as_deref()].into_iter().flatten().map(str::to_string).collect();
-                let mut calls = read_transcripts(projects, session, ev);
-                calls.retain(|u| known(&u.trace_id) || current.contains(&u.trace_id));
-                calls
-            }
-            None => Vec::new(),
-        };
+        // Turns the tracker never saw (it started mid-session) or that were
+        // deleted stay out, rather than coming back as traces of bare model calls.
+        let current: Vec<String> = [s("prompt_id"), session.trace_id.as_deref()].into_iter().flatten().map(str::to_string).collect();
+        let mut out = read_transcripts(self.projects.as_deref(), session, ev);
+        out.retain(|u| known(&u.trace_id) || current.contains(&u.trace_id));
 
         match event {
             "UserPromptSubmit" => {
@@ -672,6 +690,47 @@ mod tests {
         let reply = store.trace("p1").unwrap().into_iter().find(|s| s.span_id == "msg_s2:m0").expect("the subagent's reply");
         assert_eq!((reply.parent_id.as_deref(), reply.agent.as_deref()), (Some("msg_s2"), Some("Explore")));
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn transcript_text_sent_with_the_events_is_read_like_a_local_transcript() {
+        // A cloud session: the tracker can't open the path, so the hook sends what was appended.
+        let path = Path::new("/home/user/.claude/projects/-home-user-repo/sess-t.jsonl");
+        let cut = TRANSCRIPT.find(r#""msg_02""#).unwrap();
+        let turn2 = TRANSCRIPT[..TRANSCRIPT.find(r#""p2""#).unwrap()].rfind('\n').unwrap() + 1;
+        let chunk = |from: usize, to: usize| serde_json::json!({"from": from, "text": &TRANSCRIPT[from..to]});
+        let t0 = 1_768_471_200_000.0;
+        // `overlap` resends the first turn's text, as two hooks running at once (or a retry) would.
+        let run = |overlap: usize| {
+            let store = Store::in_memory();
+            let cc = ClaudeCode::new(None);
+            let send = |ev: Value, t: f64| store.ingest(cc.handle(&ev, t, |id| store.has_trace(id)), t).unwrap();
+            send(event(path, "UserPromptSubmit", serde_json::json!({"prompt": "Find the launch code", "transcript_chunks": {"main": chunk(0, cut)}})), t0);
+            assert_eq!(llm_spans(&store, "p1"), [("msg_01".into(), MAIN.into(), Some(t0 + 3000.0))]);
+            let main = chunk(cut - overlap, turn2);
+            let sub = serde_json::json!({"from": 0, "text": SUBAGENT_TRANSCRIPT});
+            send(event(path, "SubagentStop", serde_json::json!({"agent_id": "a1", "agent_type": "Explore", "transcript_chunks": {"main": main, "a1": sub}})), t0 + 10_100.0);
+            send(event(path, "UserPromptSubmit", serde_json::json!({"prompt_id": "p2", "prompt": "And the files?", "transcript_chunks": {"main": chunk(turn2, TRANSCRIPT.len())}})), t0 + 60_000.0);
+            store
+        };
+
+        let store = run(0);
+        let mut p1: Vec<(String, String)> = llm_spans(&store, "p1").into_iter().map(|(id, parent, _)| (id, parent)).collect();
+        p1.sort();
+        let expected = [("msg_01", MAIN), ("msg_02", MAIN), ("msg_s1", "a1"), ("msg_s2", "a1")];
+        assert_eq!(p1, expected.map(|(id, parent)| (id.to_string(), parent.to_string())));
+        assert_eq!(llm_spans(&store, "p2"), [("msg_03".into(), MAIN.into(), Some(t0 + 62_000.0))]);
+        assert_eq!(store.trace("p1").unwrap().iter().find(|s| s.span_id == "msg_01:r0").map(|s| s.kind), Some(Kind::Reasoning));
+
+        let outputs = |store: &Store| store.trace("p1").unwrap().into_iter().map(|s| (s.span_id, s.output)).collect::<Vec<_>>();
+        assert_eq!(outputs(&run(cut)), outputs(&store), "text sent twice is read once");
+
+        // Offsets come from the request; an absurd one must not take hook handling down.
+        let cc = ClaudeCode::new(None);
+        for from in [u64::MAX, u64::MAX] {
+            let ev = event(path, "Stop", serde_json::json!({"transcript_chunks": {"main": {"from": from, "text": "{}\n"}}}));
+            cc.handle(&ev, t0, |_| true);
+        }
     }
 
     #[test]
