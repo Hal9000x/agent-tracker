@@ -4,8 +4,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
+
+use crate::repo_sync;
 
 struct Harness {
     name: &'static str,
@@ -41,34 +44,43 @@ const WEB_SETTINGS: &str = include_str!("../../integrations/claude-code-web/sett
 const WEB_HOOK: &str = include_str!("../../integrations/claude-code-web/agent-tracker-hook.mjs");
 const WEB_MARKER: &str = "agent-tracker-hook.mjs";
 
-/// Sets up a repository so its Claude Code on the web sessions report to the tracker at `url`:
-/// adds the hooks to its committed `.claude/settings.json` and writes the hook script beside it.
-pub fn install_web(repo: &Path, url: &str) -> io::Result<Vec<String>> {
-    // The address ends up in a shell command, so only plain web addresses get in; and the
-    // hooks carry prompts and the ingest token across the internet, so only over https.
-    let plain = url.chars().all(|c| c.is_ascii_alphanumeric() || "-._~:/".contains(c));
-    let host = url.strip_prefix("https://").filter(|_| plain).and_then(|rest| rest.split(['/', ':']).next());
-    let Some(host) = host.filter(|h| !h.is_empty()) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{url} is not a plain https address, like https://tracker.example.com")));
+/// The top folder of the git clone holding `dir`, if it has an origin to fetch from.
+fn clone_root(dir: &Path) -> Option<PathBuf> {
+    let git = |args: &[&str]| Command::new("git").args(args).current_dir(dir).stderr(Stdio::null()).output().ok().filter(|o| o.status.success());
+    git(&["remote", "get-url", "origin"])?;
+    let root = String::from_utf8(git(&["rev-parse", "--show-toplevel"])?.stdout).ok()?;
+    Some(PathBuf::from(root.trim()))
+}
+
+/// Sets up a repository so its Claude Code on the web sessions reach this tracker: adds the
+/// hooks to its committed `.claude/settings.json`, writes the hook script beside it, and
+/// registers the clone in `data`, so the tracker fetches the `agent-tracker/*` branches the
+/// hook pushes.
+pub fn install_web(repo: &Path, data: &Path) -> io::Result<Vec<String>> {
+    let Some(root) = clone_root(repo) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not in a git clone with an origin remote; run this in your clone of the repository you use on claude.ai/code", repo.display())));
     };
-    let dir = repo.join(".claude");
+    let dir = root.join(".claude");
     fs::create_dir_all(&dir)?;
-    let ours: Value = serde_json::from_str(&WEB_SETTINGS.replace("https://tracker.example.com", url)).expect("bundled hooks are JSON");
+    let ours: Value = serde_json::from_str(WEB_SETTINGS).expect("bundled hooks are JSON");
     let settings = dir.join("settings.json");
     edit(&settings, false, |s| {
         remove_ours(s, WEB_MARKER);
         add(s, &ours)
     })?;
     fs::write(dir.join(WEB_MARKER), WEB_HOOK)?;
+    repo_sync::register(data, &root)?;
     Ok(vec![
         format!("Claude Code on the web: hooks added to {}, script written to {}", settings.display(), dir.join(WEB_MARKER).display()),
-        "Next: commit both files and push.".into(),
-        format!("Then in your claude.ai/code cloud environment: allow the domain {host}, and add a network secret for {host} (Bearer, header Authorization) holding the tracker's ingest token."),
+        "Next: commit both files and push. Then sessions on claude.ai/code in this repository show up here while the tracker runs.".into(),
+        "Each session's events travel through a branch named agent-tracker/<session> in the repository; delete those branches whenever you like.".into(),
     ])
 }
 
-/// Takes the cloud-session hooks and script out of a repository.
-pub fn uninstall_web(repo: &Path) -> io::Result<Vec<String>> {
+/// Takes the cloud-session hooks and script out of a repository, and stops fetching from it.
+pub fn uninstall_web(repo: &Path, data: &Path) -> io::Result<Vec<String>> {
+    let repo = clone_root(repo).unwrap_or_else(|| repo.to_path_buf());
+    repo_sync::unregister(data, &repo)?;
     let dir = repo.join(".claude");
     let settings = dir.join("settings.json");
     let removed = settings.exists()
@@ -249,35 +261,45 @@ mod tests {
         assert_eq!(read(&home.join(".codex/hooks.json")), json!({}), "events left empty are dropped");
     }
 
+    /// A clone with a remote, as Claude Code on the web works from.
+    fn scratch_clone(name: &str) -> PathBuf {
+        let repo = scratch_home(name);
+        for args in [&["init", "-q"][..], &["remote", "add", "origin", "https://github.com/someone/project.git"]] {
+            assert!(std::process::Command::new("git").args(args).current_dir(&repo).status().unwrap().success());
+        }
+        repo
+    }
+
     #[test]
-    fn install_web_sets_up_a_repository_for_cloud_sessions() {
-        let repo = scratch_home("web");
+    fn install_web_sets_up_a_repository_and_registers_its_clone() {
+        let (repo, data) = (scratch_clone("web"), scratch_home("web-data"));
         fs::create_dir_all(repo.join(".claude")).unwrap();
         fs::write(repo.join(".claude/settings.json"), USERS).unwrap();
 
-        install_web(&repo, "https://tracker.example.org").unwrap();
+        install_web(&repo, &data).unwrap();
 
         let settings = read(&repo.join(".claude/settings.json"));
         assert_eq!(settings["model"], "opus");
         let stop = handlers(&settings, "Stop");
         assert_eq!(stop.len(), 2, "{stop:?}");
-        assert_eq!(stop[1]["command"], r#"node "$CLAUDE_PROJECT_DIR/.claude/agent-tracker-hook.mjs" https://tracker.example.org"#);
+        assert_eq!(stop[1], json!({"type": "command", "command": r#"node "$CLAUDE_PROJECT_DIR/.claude/agent-tracker-hook.mjs""#, "async": true}));
         assert_eq!(fs::read_to_string(repo.join(".claude/agent-tracker-hook.mjs")).unwrap(), WEB_HOOK);
         assert!(!repo.join(".claude/settings.json.bak-agent-tracker").exists(), "no backup to commit by mistake; git has the old file");
+        let clone = std::path::absolute(&repo).unwrap();
+        assert_eq!(read(&data.join("web-repos.json")), json!([clone]), "the tracker fetches from this clone");
 
-        uninstall_web(&repo).unwrap();
+        uninstall_web(&repo, &data).unwrap();
         assert_eq!(read(&repo.join(".claude/settings.json")), serde_json::from_str::<Value>(USERS).unwrap());
         assert!(!repo.join(".claude/agent-tracker-hook.mjs").exists());
+        assert_eq!(read(&data.join("web-repos.json")), json!([]));
     }
 
     #[test]
-    fn install_web_takes_only_plain_web_addresses() {
-        let repo = scratch_home("web-url");
-        // Plain http would carry prompts and the ingest token across the internet readable.
-        for url in ["tracker.example.org", "https://x.org/$(id)", "https://x.org\" && rm -rf ~ \"", "https://x.org;id", "ftp://x.org", "http://x.org", "https://"] {
-            assert!(install_web(&repo, url).is_err(), "{url}");
-        }
-        assert!(!repo.join(".claude").exists());
+    fn install_web_needs_a_clone_with_a_remote() {
+        let (folder, data) = (scratch_home("web-no-clone"), scratch_home("web-no-clone-data"));
+        assert!(install_web(&folder, &data).is_err());
+        assert!(!folder.join(".claude").exists());
+        assert!(!data.join("web-repos.json").exists());
     }
 
     #[test]

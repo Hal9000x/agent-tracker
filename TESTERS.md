@@ -39,7 +39,16 @@ Hooks fire even while the tracker is off. Claude Code then notes that a hook fai
 
 ## Claude Code on the web
 
-Sessions on claude.ai/code, and the desktop app's cloud sessions, run on Anthropic's machines. A tracker on your laptop can't hear them, so they need a tracker on a server you control. See **Hosting** in the repository's README. claude.ai chat itself has no hooks and can't be tracked.
+Sessions on claude.ai/code, and the desktop app's cloud sessions, can show up too, with nothing to set up on claude.ai. Do this once per repository you use there.
+
+1. In your clone of the repository, run `agent-tracker install-web`.
+2. Commit the two files it writes, `.claude/settings.json` and `.claude/agent-tracker-hook.mjs`, and push.
+
+From then on, every web session in that repository appears in your tracker under `claude-code-web`, about 20 seconds behind, while the tracker runs.
+
+The sessions travel through branches named `agent-tracker/<session>` in the repository. Anyone who can read the repository can read them, so delete them when you're done. `agent-tracker uninstall-web` undoes the setup.
+
+claude.ai chat itself has no hooks and can't be tracked.
 
 ## Where your data is
 

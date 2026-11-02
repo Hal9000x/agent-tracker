@@ -1226,16 +1226,6 @@ main {
   border: 1px solid var(--border);
 }
 
-.snippet-label {
-  display: block;
-  margin-bottom: 4px;
-  color: var(--text-2);
-}
-
-.snippet-label + .copy {
-  top: 24px;
-}
-
 .connect .steps {
   margin: 4px 0;
   padding-left: 20px;

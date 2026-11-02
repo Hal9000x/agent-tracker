@@ -1,18 +1,21 @@
-// Agent Tracker hook for Claude Code on the web. Cloud sessions run on Anthropic's machines,
-// where the tracker can't read the session transcript, so this posts each hook event together
-// with the transcript text appended since the last event. Local sessions skip it: they use the
-// http hooks from `agent-tracker install`. Commit it as .claude/agent-tracker-hook.mjs and run it
-// from .claude/settings.json:
-//
-//   "command": "node \"$CLAUDE_PROJECT_DIR/.claude/agent-tracker-hook.mjs\" https://tracker.example.com"
+// Agent Tracker hook for Claude Code on the web. A cloud session can't reach your machine,
+// but it can push to its own repository. So this commits each hook event, with the
+// transcript text added since the last one, to the branch agent-tracker/<session id>,
+// and your local tracker fetches those branches. It never touches the session's own
+// branch, index or files. Local sessions skip it: they use the http hooks from
+// `agent-tracker install`. `agent-tracker install-web` sets it up as
+// .claude/agent-tracker-hook.mjs, run as an async command hook for each event.
 //
 // It prints nothing and always exits 0, so Claude Code carries on whatever happens here.
 
-import { closeSync, fstatSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const MAX_CHUNK = 8 << 20;
+/** How long a hook waits for this session's other hook runs; longer than any push takes. */
+const LOCK_WAIT_MS = 60_000;
 
 /** The text from byte `from` to the end of the last complete line, and the offset after it. */
 function readNew(path, from) {
@@ -43,37 +46,71 @@ function transcripts(event) {
   return files;
 }
 
-async function main() {
-  const tracker = process.argv[2];
-  if (process.env.CLAUDE_CODE_REMOTE !== "true" || !tracker) return;
-  const event = JSON.parse(readFileSync(0, "utf8"));
-  // How far each transcript has been sent, kept between this session's hook runs.
-  const state = join(tmpdir(), `agent-tracker-${String(event.session_id).replace(/[^\w-]/g, "_")}.json`);
-  let sent = {};
-  try {
-    sent = JSON.parse(readFileSync(state, "utf8"));
-  } catch {}
-  const chunks = {};
-  const next = { ...sent };
-  for (const [key, path] of transcripts(event)) {
-    const from = sent[path] ?? 0;
-    const [text, end] = readNew(path, from);
-    if (text) {
-      chunks[key] = { from, text };
-      next[path] = end;
+/** Runs `fn` holding this session's lock, so its hook runs, which Claude Code starts in parallel, take turns. */
+async function locked(lock, fn) {
+  const until = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      mkdirSync(lock);
+      break;
+    } catch {
+      // A run that died leaves its lock behind.
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > LOCK_WAIT_MS) rmdirSync(lock);
+      } catch {}
+      if (Date.now() > until) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
-  // The environment's network secret normally adds the ingest token on the way out;
-  // AGENT_TRACKER_TOKEN is for environments without one.
-  const token = process.env.AGENT_TRACKER_TOKEN;
-  const res = await fetch(new URL("api/hooks/claude-code", tracker.replace(/\/*$/, "/")), {
-    method: "POST",
-    headers: { "content-type": "application/json", ...(token && { authorization: `Bearer ${token}` }) },
-    body: JSON.stringify({ ...event, transcript_chunks: chunks }),
-    signal: AbortSignal.timeout(5000),
+  try {
+    fn();
+  } finally {
+    rmdirSync(lock);
+  }
+}
+
+function readState(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return { offsets: {} };
+  }
+}
+
+/** Commits `spool` as events.jsonl on top of `parent` with plumbing, so HEAD, the index and the files stay as they are. */
+function commit(git, spool, parent, event) {
+  const blob = git(["hash-object", "-w", spool]);
+  const tree = git(["mktree"], `100644 blob ${blob}\tevents.jsonl\n`);
+  return git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", `agent-tracker: ${event} [skip ci]`]);
+}
+
+async function main() {
+  if (process.env.CLAUDE_CODE_REMOTE !== "true") return;
+  const time = Date.now();
+  const event = JSON.parse(readFileSync(0, "utf8"));
+  const repo = process.env.CLAUDE_PROJECT_DIR || event.cwd;
+  const session = String(event.session_id).replace(/[^\w-]/g, "_");
+  const base = join(tmpdir(), `agent-tracker-${session}`);
+  const env = { ...process.env, GIT_AUTHOR_NAME: "Agent Tracker", GIT_AUTHOR_EMAIL: "agent-tracker@localhost", GIT_COMMITTER_NAME: "Agent Tracker", GIT_COMMITTER_EMAIL: "agent-tracker@localhost", GIT_TERMINAL_PROMPT: "0" };
+  const git = (args, input) => execFileSync("git", args, { cwd: repo, env, input, encoding: "utf8", timeout: 30_000, stdio: ["pipe", "pipe", "ignore"] }).trim();
+
+  await locked(`${base}.lock`, () => {
+    const state = readState(`${base}.json`);
+    const chunks = {};
+    for (const [key, path] of transcripts(event)) {
+      const from = state.offsets[path] ?? 0;
+      const [text, end] = readNew(path, from);
+      if (text) {
+        chunks[key] = { from, text };
+        state.offsets[path] = end;
+      }
+    }
+    appendFileSync(`${base}.jsonl`, JSON.stringify({ ...event, transcript_chunks: chunks, agent_tracker_time: time }) + "\n");
+    state.head = commit(git, `${base}.jsonl`, state.head, event.hook_event_name);
+    writeFileSync(`${base}.json`, JSON.stringify(state));
+    // A failed push is retried by the next event, whose commit carries everything so far.
+    git(["push", "--quiet", "origin", `${state.head}:refs/heads/agent-tracker/${session}`]);
   });
-  // Text the tracker didn't take goes again next time; it skips what it already has.
-  if (res.ok) writeFileSync(state, JSON.stringify(next));
 }
 
 main()

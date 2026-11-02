@@ -46,13 +46,18 @@ Each turn of the Codex CLI or app becomes one trace: the prompt, the main agent,
 
 ### Claude Code on the web
 
-Cloud sessions (claude.ai/code, and the desktop app's cloud sessions) run on Anthropic's machines. They load hooks only from the repository's committed `.claude/settings.json`, and they can reach only domains their environment allows. So they need a [hosted tracker](#hosting), and the tracker can't read their transcripts. Instead, a hook script ships the transcript text with each event.
+Cloud sessions (claude.ai/code, and the desktop app's cloud sessions) run on Anthropic's machines. They load hooks only from the repository's committed `.claude/settings.json`. With the default network settings, the one place they can send data is their own GitHub repository. So the hook sends the events through the repository, and nothing needs setting up on claude.ai.
 
-1. In the repository, run `agent-tracker install-web https://tracker.example.com`. It adds command hooks to `.claude/settings.json` and writes [`.claude/agent-tracker-hook.mjs`](integrations/claude-code-web/agent-tracker-hook.mjs) beside it. Commit both and push. The script does nothing in local sessions (`CLAUDE_CODE_REMOTE` isn't set there), so local tracking isn't doubled.
-2. In the claude.ai/code environment's settings, set **Network access** to **Custom** and add the tracker's domain to **Allowed domains**.
-3. In the same environment, add a **network secret** for that domain: type Bearer, header `Authorization`, value the ingest token from the hosted tracker's Connect panel. The proxy adds it on the way out, so the token never sits in the repository or the session. Without network secrets, set `AGENT_TRACKER_TOKEN` in the environment's variables instead; anyone who can use the environment can read those.
+In your clone of the repository, run `agent-tracker install-web`, then commit and push the two files it writes:
 
-`agent-tracker uninstall-web` takes the hooks and script out again. claude.ai chat and the desktop app's Chat tab have no hooks and can't be tracked.
+- `.claude/settings.json` gets async command hooks;
+- [`.claude/agent-tracker-hook.mjs`](integrations/claude-code-web/agent-tracker-hook.mjs) goes beside it.
+
+In a cloud session, the script commits each event, with the transcript text added since the last one, to the branch `agent-tracker/<session id>` and pushes it. It uses git plumbing, so the session's own branch, index and files stay as they were, and `[skip ci]` keeps the pushes from starting CI. In local sessions (`CLAUDE_CODE_REMOTE` isn't set) it does nothing, so local tracking isn't doubled.
+
+`install-web` also registers the clone with the tracker. While the tracker runs, it fetches `agent-tracker/*` branches into the clone every 15 seconds, using your usual git credentials and its own ref namespace, `refs/agent-tracker/`. It then reads the events it hasn't seen yet, timed from when they happened in the session. Web sessions appear under the source `claude-code-web`, usually within about 20 seconds of each step.
+
+Anyone who can read the repository can read those branches, which hold prompts, tool output and reasoning. Delete them whenever you like. `agent-tracker uninstall-web` takes the hooks and script out and stops fetching. claude.ai chat and the desktop app's Chat tab have no hooks and can't be tracked.
 
 ### OpenTelemetry
 
@@ -127,11 +132,11 @@ Other endpoints: `GET /api/traces`, `GET /api/traces/{id}`, `DELETE /api/traces/
 
 ## Hosting
 
-A hosted tracker is this same program, run on a server you control so that cloud sessions can reach it. Start it with `--public-url`, the address people and hooks use. That turns on sign-in. A `--host` other than this machine also requires `--public-url`.
+A hosted tracker is this same program, run on a server you control so that agents on other machines can report to it over OTLP or the clients. Claude Code on the web doesn't need one. Start it with `--public-url`, the address people and agents use. That turns on sign-in. A `--host` other than this machine also requires `--public-url`.
 
 - **Signing in:** the owner signs in with `AGENT_TRACKER_USERNAME` (default `admin`) and `AGENT_TRACKER_PASSWORD` (12+ characters), both read from the environment. It refuses to start without a password. Sessions last 30 days. After ten failed sign-ins in a minute, that client is refused for the rest of the minute; others aren't. Behind a proxy on the same machine or a private network, the client is the address the proxy puts last in `X-Forwarded-For`.
-- **Sending data:** hooks, `/api/spans` and `/v1/traces` need `Authorization: Bearer <ingest token>`. The token is made on first start, kept in `<data>/ingest-token`, and shown in the Connect panel once you're signed in. To replace it, delete that file and restart. A network secret adds the token to every request the cloud session makes to your tracker's domain. So anything running in that session can add data, though only the owner can read it.
-- **HTTPS:** the program speaks plain HTTP, so put HTTPS in front of it. Use a reverse proxy, for example `caddy reverse-proxy --from tracker.example.com --to 127.0.0.1:4318`, or your platform's. `install-web` accepts only https addresses.
+- **Sending data:** hooks, `/api/spans` and `/v1/traces` need `Authorization: Bearer <ingest token>`. The token is made on first start, kept in `<data>/ingest-token`, and shown in the Connect panel once you're signed in. To replace it, delete that file and restart. Whoever holds the token can add data; only the owner can read it.
+- **HTTPS:** the program speaks plain HTTP, so put HTTPS in front of it. Use a reverse proxy, for example `caddy reverse-proxy --from tracker.example.com --to 127.0.0.1:4318`, or your platform's.
 - A hosted tracker answers only to its public host name and the local names, and it never opens transcript files on the server it runs on.
 
 With Docker ([`Dockerfile`](Dockerfile)):

@@ -5,6 +5,7 @@ mod codex;
 mod demo;
 mod model;
 mod otlp;
+mod repo_sync;
 mod setup;
 mod store;
 mod transcript;
@@ -23,8 +24,8 @@ const USAGE: &str = "usage: agent-tracker [--host 127.0.0.1] [--port 4318] [--da
        set AGENT_TRACKER_PASSWORD (12+ characters) and optionally AGENT_TRACKER_USERNAME (default admin)
        agent-tracker install [--port 4318]   add the tracker's hooks to Claude Code and Codex
        agent-tracker uninstall               take them out again
-       agent-tracker install-web <url>       in a repository: report its Claude Code on the web sessions to the tracker at <url>
-       agent-tracker uninstall-web           in a repository: take that out again
+       agent-tracker install-web             in a clone: track its Claude Code on the web sessions here
+       agent-tracker uninstall-web           in a clone: stop that
        agent-tracker --version";
 
 #[derive(Debug, PartialEq)]
@@ -32,7 +33,7 @@ enum Mode {
     Serve,
     Install,
     Uninstall,
-    InstallWeb(String),
+    InstallWeb,
     UninstallWeb,
     Version,
 }
@@ -93,7 +94,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         match flag.as_str() {
             "install" => args.mode = Mode::Install,
             "uninstall" => args.mode = Mode::Uninstall,
-            "install-web" => args.mode = Mode::InstallWeb(value()?),
+            "install-web" => args.mode = Mode::InstallWeb,
             "uninstall-web" => args.mode = Mode::UninstallWeb,
             "-V" | "--version" => args.mode = Mode::Version,
             "--host" => args.host = value()?,
@@ -166,8 +167,8 @@ async fn main() {
         Mode::Version => return println!("agent-tracker {}", env!("CARGO_PKG_VERSION")),
         Mode::Install => Some(setup::install(&home(), args.port)),
         Mode::Uninstall => Some(setup::uninstall(&home())),
-        Mode::InstallWeb(url) => Some(setup::install_web(&repo(), url)),
-        Mode::UninstallWeb => Some(setup::uninstall_web(&repo())),
+        Mode::InstallWeb => Some(setup::install_web(&repo(), &args.data)),
+        Mode::UninstallWeb => Some(setup::uninstall_web(&repo(), &args.data)),
     };
     // These run from a terminal, so a failure needs no "Press Enter" pause.
     match done {
@@ -199,7 +200,7 @@ async fn main() {
     let auth = needs_sign_in(&args).then(|| sign_in_from_env(&args));
     let signed_in_as = auth.as_ref().map(|a| a.username().to_string());
     // A hosted tracker hears from other machines only, so it never opens transcript or
-    // rollout files on its own; cloud hooks send their transcript text along.
+    // rollout files on its own; web sessions send their transcript text along.
     let hosted = auth.is_some();
     let app = Arc::new(api::App {
         store,
@@ -226,8 +227,32 @@ async fn main() {
     if args.open {
         open_browser(&url);
     }
+    tokio::spawn(sync_web_sessions(app.clone(), args.data.clone()));
     // Sign-in counts failures per client address.
     axum::serve(listener, api::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+}
+
+/// How often the clones `install-web` registered are fetched for new web-session events.
+const WEB_SYNC_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Feeds the events Claude Code on the web sessions push to their repositories into the tracker.
+async fn sync_web_sessions(app: Arc<api::App>, data: PathBuf) {
+    let mut sync = repo_sync::RepoSync::new(&data);
+    loop {
+        let (back, events) = tokio::task::spawn_blocking(move || {
+            let events = sync.poll();
+            (sync, events)
+        })
+        .await
+        .expect("web session sync");
+        sync = back;
+        for ev in events {
+            if let Err(e) = api::web_session_event(&app, &ev) {
+                eprintln!("web session sync: {e}");
+            }
+        }
+        tokio::time::sleep(WEB_SYNC_INTERVAL).await;
+    }
 }
 
 #[cfg(test)]
@@ -306,8 +331,7 @@ mod tests {
         let install = parse("install --port 9000").unwrap();
         assert_eq!((install.mode, install.port), (Mode::Install, 9000));
         assert_eq!(parse("uninstall").unwrap().mode, Mode::Uninstall);
-        assert_eq!(parse("install-web https://t.example.org").unwrap().mode, Mode::InstallWeb("https://t.example.org".into()));
-        assert!(parse("install-web").is_err(), "needs the address");
+        assert_eq!(parse("install-web --data here").unwrap().mode, Mode::InstallWeb);
 
         assert!(!needs_sign_in(&parse("").unwrap()));
         assert!(!needs_sign_in(&parse("--host ::1").unwrap()));

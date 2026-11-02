@@ -9,7 +9,7 @@ interface Harness {
   what: string;
   /** One paragraph, or numbered steps. */
   where: string | string[];
-  snippets: { label?: string; text: string }[];
+  snippets: { text: string }[];
 }
 
 const DEFAULT_PORT = "4318";
@@ -27,7 +27,7 @@ function trackerOrigin(): string {
 
 const OTEL: Omit<Harness, "snippets"> = {
   name: "OpenTelemetry",
-  matches: (s) => !s.startsWith("sdk:") && !["claude-code", "codex", "hermes"].includes(s),
+  matches: (s) => !s.startsWith("sdk:") && !["claude-code", "claude-code-web", "codex", "hermes"].includes(s),
   what: "Any agent framework that exports OTLP/HTTP traces (OpenAI Agents SDK, LangGraph via OpenLLMetry, Pydantic AI, …). GenAI semantic conventions are understood.",
   where: "Set in the environment of the process you want to trace.",
 };
@@ -53,10 +53,13 @@ function localHarnesses(origin: string): Harness[] {
     },
     {
       name: "Claude Code on the web",
-      matches: () => false,
-      what: "Sessions on claude.ai/code and the desktop app's cloud sessions, with model calls and reasoning.",
-      where: "These run on Anthropic's machines, so they need a tracker they can reach over the internet: run Agent Tracker on a server with --public-url and a password (see Hosting in the README), then follow the steps in that tracker's Connect panel.",
-      snippets: [],
+      matches: (s) => s === "claude-code-web",
+      what: "Sessions on claude.ai/code and the desktop app's cloud sessions: tool calls, subagents, and each model call with its reasoning and messages. Nothing to set up on claude.ai.",
+      where: [
+        "In your clone of the repository, run the command below, then commit .claude/settings.json and .claude/agent-tracker-hook.mjs and push.",
+        "Each session's hook pushes its events to a branch named agent-tracker/<session> in that repository, and this tracker fetches them every 15 seconds while it runs. Anyone who can read the repository can read those branches; delete them whenever you like.",
+      ],
+      snippets: [{ text: "agent-tracker install-web" }],
     },
     { ...OTEL, snippets: [{ text: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${origin}/v1/traces\nOTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` }] },
     {
@@ -73,21 +76,9 @@ function localHarnesses(origin: string): Harness[] {
   ];
 }
 
-/** Harnesses for a tracker reachable from the internet, which hooks reach with the ingest token. */
+/** Harnesses for a tracker reachable from the internet, which they reach with the ingest token. */
 function hostedHarnesses(origin: string, token: string): Harness[] {
-  const host = new URL(origin).hostname;
   return [
-    {
-      name: "Claude Code on the web",
-      matches: claudeCode,
-      what: "Sessions on claude.ai/code and the desktop app's cloud sessions: tool calls, subagents, and each model call with its reasoning and messages, sent by a hook script committed to the repository.",
-      where: [
-        "In the repository, run the command below, then commit .claude/settings.json and .claude/agent-tracker-hook.mjs and push.",
-        `At claude.ai/code, open your cloud environment's settings: set Network access to Custom and add ${host} to Allowed domains (keep the package-manager defaults if your setup needs them).`,
-        `In the same environment, add a network secret for ${host}: type Bearer, header Authorization, holding the ingest token below. It is added on the way out, so the token never sits in the repository or the session.`,
-      ],
-      snippets: [{ text: `agent-tracker install-web ${origin}` }, { label: "Ingest token", text: token }],
-    },
     {
       ...OTEL,
       snippets: [{ text: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${origin}/v1/traces\nOTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf\nOTEL_EXPORTER_OTLP_TRACES_HEADERS=Authorization=Bearer ${token}` }],
@@ -101,7 +92,7 @@ function lastSeen(traces: TraceSummary[], h: Harness): number | null {
   return latest;
 }
 
-function Snippet({ label, text }: { label?: string; text: string }) {
+function Snippet({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   const copy = () =>
     navigator.clipboard.writeText(text).then(() => {
@@ -110,7 +101,6 @@ function Snippet({ label, text }: { label?: string; text: string }) {
     });
   return (
     <div className="snippet">
-      {label && <span className="snippet-label">{label}</span>}
       <button className="tool-btn copy" onClick={copy}>
         {copied ? "Copied" : "Copy"}
       </button>

@@ -180,6 +180,19 @@ fn now_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
+/// Handles a Claude Code hook event a web session pushed to its repository (see `repo_sync`),
+/// timed from when it happened in the session rather than when it was fetched.
+pub fn web_session_event(app: &App, ev: &Value) -> std::io::Result<()> {
+    let at = ev["agent_tracker_time"].as_f64().unwrap_or_else(now_ms);
+    let mut updates = app.claude_code.handle(ev, at, |t| app.store.has_trace(t));
+    for u in &mut updates {
+        if u.attrs.contains_key("source") {
+            u.attrs.insert("source".into(), "claude-code-web".into());
+        }
+    }
+    app.store.ingest(updates, now_ms())
+}
+
 fn ingest(app: &App, updates: Vec<SpanUpdate>) -> Result<(), ApiError> {
     app.store.ingest(updates, now_ms()).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")))
 }
@@ -508,5 +521,14 @@ mod tests {
     #[tokio::test]
     async fn a_local_tracker_needs_no_sign_in() {
         assert_eq!(call(&app(), "GET", "/api/session", &[], "").await.2, serde_json::json!({"auth": false, "signed_in": true}));
+    }
+
+    #[test]
+    fn web_session_events_are_labelled_and_timed_when_they_happened() {
+        let app = App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "127.0.0.1".into(), auth: None };
+        let ev = serde_json::json!({"session_id": "s", "prompt_id": "p", "hook_event_name": "UserPromptSubmit", "prompt": "hi", "agent_tracker_time": 1000.0});
+        web_session_event(&app, &ev).unwrap();
+        let trace = &app.store.traces()[0];
+        assert_eq!((trace.source.as_deref(), trace.start), (Some("claude-code-web"), 1000.0));
     }
 }
