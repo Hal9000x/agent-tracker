@@ -676,11 +676,11 @@ mod tests {
         let path = dir.join("rollout.jsonl");
         let whole = Parser::default().parse(ROLLOUT);
         // Cut mid-line: the partial line must wait for the rest.
-        let cut = ROLLOUT.len() / 2 + 7;
-        fs::write(&path, &ROLLOUT[..cut]).unwrap();
+        let (bytes, cut) = (ROLLOUT.as_bytes(), ROLLOUT.len() / 2 + 7);
+        fs::write(&path, &bytes[..cut]).unwrap();
         let mut rollout = Rollout::default();
         let mut pieces = rollout.read(&path).unwrap();
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(ROLLOUT[cut..].as_bytes()).unwrap();
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(&bytes[cut..]).unwrap();
         pieces.extend(rollout.read(&path).unwrap());
         assert_eq!(rollout.read(&path).unwrap(), Parsed::default(), "nothing is read twice");
         assert_eq!(pieces, whole);
