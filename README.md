@@ -34,6 +34,16 @@ Merge [`integrations/claude-code/settings.json`](integrations/claude-code/settin
 
 Each prompt you submit becomes one trace: the prompt, the main agent, every tool call, and each subagent nested under the `Agent` tool call that started it. Parallel subagents show up as a fork. If the tracker is not running, Claude Code prints a non-blocking "hook failed" notice and carries on.
 
+Model calls come from the session transcript that every hook event names (`~/.claude/projects/<project>/<session>.jsonl`). Each API response becomes an `llm` step with its model, token counts (input includes cache reads and writes) and timing. Under it, each thinking block becomes a `reasoning` step and each block of reply text a `message` step. The tracker reads only `.jsonl` files under `~/.claude/projects`, and only for turns it has seen, so starting it mid-session doesn't fill the list with earlier turns.
+
+A message you send while Claude is still working starts a new trace, and the previous turn ends normally rather than as interrupted.
+
+### Codex
+
+Save [`integrations/codex/hooks.json`](integrations/codex/hooks.json) as `~/.codex/hooks.json` (merge the event arrays if you already have one). Then run `codex`, type `/hooks` and approve the new hooks once: Codex silently skips hooks nobody approved. The hooks pipe each event to the tracker with `curl` (`curl.exe` on Windows); with the tracker down, each costs about 0.25 s.
+
+Each turn of the Codex CLI or app becomes one trace: the prompt, the main agent, tool calls, and subagents nested under the `spawn_agent` call that started them. Model calls come from the session's rollout file under `~/.codex/sessions`: one `llm` step per response with its token counts, a `reasoning` step per reasoning item and a `message` step per reply. Codex keeps the full reasoning encrypted, so a reasoning step shows the summary Codex writes, or "(reasoning not shown)" when there is none.
+
 ### OpenTelemetry
 
 Point any OTLP/HTTP exporter at the tracker. Protobuf and JSON both work.
@@ -93,7 +103,7 @@ See [`clients/python/examples/demo.py`](clients/python/examples/demo.py) for a s
 |---|---|---|
 | `trace_id`, `span_id` | string | required |
 | `parent_id` | string | the span that started this one |
-| `kind` | `message` `agent` `llm` `tool` `split` `fork` `join` `step` | children of `split`/`fork` are drawn as parallel branches; unknown kinds become `step` |
+| `kind` | `message` `agent` `llm` `tool` `split` `fork` `join` `reasoning` `step` | children of `split`/`fork` are drawn as parallel branches; unknown kinds become `step` |
 | `name`, `agent` | string | `agent` is inherited by descendants for display |
 | `start`, `end` | number | epoch milliseconds; a span without `end` is running |
 | `status` | `running` `ok` `error` | defaults from `end`; a late `running` never reopens an ended span |
@@ -103,7 +113,7 @@ See [`clients/python/examples/demo.py`](clients/python/examples/demo.py) for a s
 | `attrs` | object | merged key by key |
 | `links` | string[] | span ids this span received output from; drawn as dashed message edges |
 
-Other endpoints: `GET /api/traces`, `GET /api/traces/{id}`, `GET /api/stream` (SSE), `POST /v1/traces` (OTLP), `POST /api/hooks/claude-code`, `POST /api/demo` (replays the demo runs).
+Other endpoints: `GET /api/traces`, `GET /api/traces/{id}`, `DELETE /api/traces/{id}`, `GET /api/stream` (SSE), `POST /v1/traces` (OTLP), `POST /api/hooks/claude-code`, `POST /api/hooks/codex`, `POST /api/demo` (replays the demo runs).
 
 ## Using the views
 
@@ -143,6 +153,8 @@ For UI work, run the daemon, then `npm run dev` in `web/`. Vite proxies `/api` a
 ## Limits
 
 - No authentication. The daemon binds to `127.0.0.1` by default; only expose it on a trusted network. To keep web pages you visit from reaching it, it refuses requests that name a foreign `Host` (DNS rebinding) and writes that aren't `application/json` or `application/x-protobuf` (cross-site form posts).
-- No retention or delete yet. To start over, stop the daemon and remove `data/spans.jsonl`.
-- The Network table renders every row without virtualization, so traces with many thousands of spans will feel slow.
+- No automatic retention. Delete traces from the list; a deleted trace stays in `data/spans.jsonl` (with a tombstone) until you remove the file.
+- Prompts, tool inputs and outputs, reasoning and replies are stored in plain text in `data/spans.jsonl`. They never leave your machine, but treat the file as you would the transcripts themselves.
+- Claude Code transcripts and Codex rollout files are undocumented formats. The readers skip what they don't recognize, so a format change loses model calls rather than breaking tracking.
+- The tracker keeps which trace each running subagent belongs to in memory. After a restart, a subagent that was already running joins the current turn.
 - OTLP over gRPC and compressed OTLP/HTTP are not supported.
