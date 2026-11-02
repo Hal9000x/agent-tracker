@@ -210,6 +210,24 @@ impl ClaudeCode {
         let span = |id: &str| SpanUpdate::new(trace_id.clone(), id);
         let tool_use_id = s("tool_use_id").unwrap_or_default();
 
+        // A subagent already running when the tracker started never sent SubagentStart;
+        // adopt it into the current turn so its steps hang off a real agent span.
+        if let Some(agent) = agent_id
+            && event != "SubagentStart"
+            && !session.agent_traces.contains_key(agent)
+        {
+            session.agent_traces.insert(agent.to_string(), trace_id.clone());
+            session.opened(&trace_id, agent);
+            out.push(SpanUpdate {
+                parent_id: Some(MAIN.into()),
+                kind: Some(Kind::Agent),
+                name: s("agent_type").map(str::to_string),
+                agent: s("agent_type").map(str::to_string),
+                start: Some(now),
+                ..span(agent)
+            });
+        }
+
         match event {
             "PreToolUse" if !tool_use_id.is_empty() => {
                 let tool_input = ev.get("tool_input").cloned();
@@ -558,6 +576,33 @@ mod tests {
         assert_eq!((reply.kind, reply.parent_id.as_deref(), reply.agent.as_deref()), (Kind::Message, Some("msg_02"), Some("claude-code")));
         assert_eq!(by("msg_01:r0").kind, Kind::Reasoning);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_subagent_already_running_when_the_tracker_starts_becomes_an_agent_span() {
+        let store = Store::in_memory();
+        let cc = ClaudeCode::default();
+        let send = |ev: Value, t: f64| store.ingest(cc.handle(&ev, t, |id| store.has_trace(id)), t).unwrap();
+        let ev = |name: &str, extra: Value| {
+            let mut e = serde_json::json!({"session_id": "s", "prompt_id": "p1", "hook_event_name": name});
+            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            e
+        };
+        send(ev("UserPromptSubmit", serde_json::json!({"prompt": "go"})), 1.0);
+        // This subagent started before the tracker did, so its SubagentStart was never seen.
+        let sub = serde_json::json!({"agent_id": "a7", "agent_type": "general-purpose"});
+        let mut tool = sub.clone();
+        tool.as_object_mut().unwrap().extend(serde_json::json!({"tool_name": "Bash", "tool_use_id": "t1"}).as_object().unwrap().clone());
+        send(ev("PreToolUse", tool.clone()), 2.0);
+        send(ev("PostToolUse", tool), 3.0);
+        send(ev("SubagentStop", sub), 4.0);
+
+        let spans = store.trace("p1").unwrap();
+        let by = |id: &str| spans.iter().find(|s| s.span_id == id).unwrap_or_else(|| panic!("no span {id}"));
+        let agent = by("a7");
+        assert_eq!((agent.kind, agent.name.as_str(), agent.agent.as_deref()), (Kind::Agent, "general-purpose", Some("general-purpose")));
+        assert_eq!((agent.parent_id.as_deref(), agent.start, agent.end, agent.status), (Some(MAIN), 2.0, Some(4.0), Status::Ok));
+        assert_eq!(by("t1").parent_id.as_deref(), Some("a7"));
     }
 
     #[test]
