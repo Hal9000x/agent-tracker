@@ -627,8 +627,18 @@ main {
   color: var(--text);
 }
 
+.tab-list {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
 .tab {
+  flex: none;
   padding: 0 10px;
+  white-space: nowrap;
   color: var(--text-2);
   border-bottom: 2px solid transparent;
 }
@@ -845,17 +855,55 @@ main {
   flex: 1;
   min-height: 0;
   display: flex;
+  position: relative;
 }
 
 .canvas {
   flex: 1;
   min-width: 0;
   position: relative;
+  overflow: hidden;
 }
 
-.graph .details {
-  flex: 0 0 440px;
+/* Details float over the canvas so the diagram keeps its full size. */
+.graph-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(420px, 45%);
+  z-index: 5;
+  display: flex;
   border-left: 1px solid var(--border);
+  box-shadow: -10px 0 28px rgba(0, 0, 0, 0.45);
+}
+
+.drawer-toggle {
+  flex: none;
+  width: 28px;
+  color: var(--text-2);
+}
+
+.drawer-toggle:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.drawer-tab {
+  position: absolute;
+  top: 10px;
+  right: 0;
+  z-index: 5;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: 4px 0 0 4px;
+  background: var(--bg-elev);
+  color: var(--text-2);
+}
+
+.drawer-tab:hover {
+  color: var(--text);
 }
 
 .segmented {
@@ -1004,7 +1052,13 @@ main {
 }
 
 .fnode.picked {
-  box-shadow: 0 0 0 2px var(--accent), 0 4px 16px rgba(0, 0, 0, 0.5);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent), 0 0 22px rgba(138, 180, 248, 0.55);
+}
+
+.fnode.on-path {
+  border-color: rgba(138, 180, 248, 0.7);
+  box-shadow: 0 0 0 1px rgba(138, 180, 248, 0.45), 0 2px 8px rgba(0, 0, 0, 0.35);
 }
 
 .fnode.dim {

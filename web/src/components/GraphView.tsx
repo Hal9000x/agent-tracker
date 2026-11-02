@@ -17,7 +17,7 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   agentColor,
   agentGraph,
@@ -51,6 +51,7 @@ const LABEL = 20;
 // dagre recurses along long paths: ~160 ms at 1,000 chained nodes, stack
 // overflow near 1,800. Bigger graphs get the linear layered layout.
 const DAGRE_MAX_NODES = 1000;
+const ACCENT = "#8ab4f8";
 // The minimap draws every node and never culls: about 2.3 s to open 20k nodes.
 const MINIMAP_MAX_NODES = 2000;
 const HANDLE = 10; // .react-flow__handle in styles.css: 8px plus a 1px border
@@ -64,7 +65,8 @@ const SPAN_HANDLES: NodeHandle[] = [
 type Mode = "steps" | "agents";
 type Point = { x: number; y: number };
 type Stats = { llm: number; tool: number; tokens: number; errors: number };
-type SpanData = { span: Span; agent?: string; dim: boolean; picked: boolean; stats?: Stats };
+/** `picked` is the selected step; `path` marks the steps upstream and downstream of it. */
+type SpanData = { span: Span; agent?: string; dim: boolean; picked: boolean; path: boolean; stats?: Stats };
 type GroupData = { label: string; color: string };
 type SpanNode = Node<SpanData, "span" | "agent">;
 type GroupNode = Node<GroupData, "agentGroup">;
@@ -73,11 +75,14 @@ type GroupNode = Node<GroupData, "agentGroup">;
 // nodes on screen instead of handing React Flow a new object for every node.
 const Now = createContext(0);
 
+const nodeClass = ({ span, dim, picked, path }: SpanData) =>
+  `fnode status-${span.status}${dim ? " dim" : ""}${picked ? " picked" : ""}${path ? " on-path" : ""}`;
+
 function StepNode({ data }: NodeProps<SpanNode>) {
-  const { span, agent, dim, picked } = data;
+  const { span, agent } = data;
   const now = useContext(Now);
   return (
-    <div className={`fnode status-${span.status}${dim ? " dim" : ""}${picked ? " picked" : ""}`} style={{ "--kind": KIND_COLOR[span.kind] } as CSSProperties}>
+    <div className={nodeClass(data)} style={{ "--kind": KIND_COLOR[span.kind] } as CSSProperties}>
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="fnode-head">
         <KindIcon kind={span.kind} />
@@ -99,13 +104,13 @@ function StepNode({ data }: NodeProps<SpanNode>) {
 }
 
 function AgentNode({ data }: NodeProps<SpanNode>) {
-  const { span, agent, dim, picked, stats } = data;
+  const { span, agent, stats } = data;
   const now = useContext(Now);
   const title = span.kind === "agent" ? (agent ?? span.name) : span.name;
   const parts = stats && [stats.llm && `${stats.llm} llm`, stats.tool && `${stats.tool} tools`, stats.tokens && `${fmtCount(stats.tokens)} tok`].filter(Boolean);
   return (
     <div
-      className={`fnode agent-node status-${span.status}${dim ? " dim" : ""}${picked ? " picked" : ""}`}
+      className={`${nodeClass(data)} agent-node`}
       style={{ "--kind": span.kind === "agent" ? agentColor(agent) : KIND_COLOR[span.kind] } as CSSProperties}
     >
       <Handle type="target" position={Position.Left} isConnectable={false} />
@@ -216,6 +221,8 @@ function startViewport(positions: Map<string, Point>, w: number, h: number) {
 export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewProps) {
   const [mode, setMode] = useState<Mode>("steps");
   const [search, setSearch] = useState("");
+  const [focusPath, setFocusPath] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(true);
 
   const steps = useMemo(() => flowEdges(tree), [tree]);
   const agents = useMemo(() => (mode === "agents" ? agentGraph(tree, steps) : null), [mode, tree, steps]);
@@ -240,7 +247,7 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
   const flowNodes = useMemo(() => {
     const members = (n: Span) => agents?.owned.get(n.span_id) ?? [n];
     const isDim = (n: Span) =>
-      (lit !== null && !lit.has(n.span_id)) ||
+      (focusPath && lit !== null && !lit.has(n.span_id)) ||
       (match !== null && !members(n).some((s) => match(s, agentOf(s, tree)))) ||
       (clip !== null && !members(n).some((s) => overlaps(s, clip[0], clip[1], clipNow)));
 
@@ -259,6 +266,7 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
           agent: agentOf(n, tree),
           dim: isDim(n),
           picked: n.span_id === focus,
+          path: lit !== null && n.span_id !== focus && lit.has(n.span_id),
           stats: agents
             ? members(n).reduce(
                 (st, s) => ({
@@ -299,7 +307,7 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
       }
     }
     return list;
-  }, [nodes, positions, agents, tree, lit, match, focus, clip, clipNow]);
+  }, [nodes, positions, agents, tree, lit, match, focus, focusPath, clip, clipNow]);
 
   const flowEdgesRf = useMemo(() => {
     const partLabel = (e: FlowEdge) => {
@@ -310,8 +318,9 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
     };
 
     return edges.map((e): Edge => {
-      const dim = lit !== null && (e.back || !(lit.has(e.source) && lit.has(e.target)));
-      const color = e.link ? "#c58af9" : "#80868b";
+      const onPath = lit !== null && !e.back && lit.has(e.source) && lit.has(e.target);
+      const dim = focusPath && lit !== null && !onPath;
+      const color = onPath ? ACCENT : e.link ? "#c58af9" : "#80868b";
       const back = (positions.get(e.target)?.x ?? 0) <= (positions.get(e.source)?.x ?? 0);
       return {
         id: e.id,
@@ -322,11 +331,11 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
         label: e.count > 1 ? `×${e.count}` : e.link ? "message" : back ? "returns" : partLabel(e),
         className: dim ? "dim" : undefined,
         markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
-        style: { stroke: color, strokeWidth: 1.5, ...(e.link ? { strokeDasharray: "6 4" } : {}) },
+        style: { stroke: color, strokeWidth: onPath ? 2.5 : 1.5, ...(e.link ? { strokeDasharray: "6 4" } : {}) },
         zIndex: 999,
       };
     });
-  }, [edges, lit, positions, tree, agents]);
+  }, [edges, lit, positions, tree, agents, focusPath]);
 
   const span = selected ? tree.byId.get(selected) : undefined;
 
@@ -342,6 +351,29 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
     started.current = viewKey;
     flow.current.setViewport(startViewport(positions, canvas.current.clientWidth, canvas.current.clientHeight));
   }, [flowKey, viewKey, ownPositions, positions]);
+
+  // The details drawer floats over the canvas, so the whole diagram stays put;
+  // a selected step outside the uncovered part is panned into it.
+  const drawer = useRef<HTMLDivElement>(null);
+  const drawerShown = !!span && drawerOpen;
+  const [covered, setCovered] = useState(0);
+  useLayoutEffect(() => {
+    const el = drawer.current;
+    if (!el) return setCovered(0);
+    const ro = new ResizeObserver(() => setCovered(el.offsetWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [drawerShown]);
+  useEffect(() => {
+    const rf = flow.current;
+    const el = canvas.current;
+    const p = focus ? positions.get(focus) : undefined;
+    if (!rf || !el || !p || flowKey !== viewKey || !ownPositions) return;
+    const { x, y, zoom } = rf.getViewport();
+    const [left, top] = [p.x * zoom + x, p.y * zoom + y];
+    const fits = left >= 16 && top >= 16 && left + NODE_W * zoom <= el.clientWidth - covered - 16 && top + NODE_H * zoom <= el.clientHeight - 16;
+    if (!fits) rf.setCenter(p.x + NODE_W / 2 + covered / 2 / zoom, p.y + NODE_H / 2, { zoom, duration: 300 });
+  }, [focus, flowKey, viewKey, ownPositions, covered]);
 
   return (
     <div className="graph">
@@ -359,6 +391,9 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
           <span className="legend-line" /> flow
           <span className="legend-line link" /> message
         </span>
+        <label className="check" title="Dim every step that is not upstream or downstream of the selected one">
+          <input type="checkbox" checked={focusPath} onChange={(e) => setFocusPath(e.target.checked)} /> Focus path
+        </label>
         {clip && <span className="hint">Clip active: spans outside it are dimmed</span>}
       </div>
       <div className="graph-area">
@@ -384,13 +419,39 @@ export function GraphView({ trace, tree, now, selected, onSelect, clip }: ViewPr
             >
               <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#3c4043" />
               {flowNodes.length <= MINIMAP_MAX_NODES && (
-                <MiniMap pannable zoomable nodeColor={(n) => (n.type === "agentGroup" ? "transparent" : KIND_COLOR[(n.data as SpanData).span.kind])} maskColor="#20212499" />
+                <MiniMap
+                  pannable
+                  zoomable
+                  style={{ marginRight: covered + 15 }}
+                  nodeColor={(n) => (n.type === "agentGroup" ? "transparent" : n.id === focus ? ACCENT : KIND_COLOR[(n.data as SpanData).span.kind])}
+                  maskColor="#20212499"
+                />
               )}
               <Controls showInteractive={false} />
             </ReactFlow>
           </Now.Provider>
         </div>
-        {span && <SpanDetails span={span} tree={tree} now={now} onSelect={onSelect} onClose={() => onSelect(null)} />}
+        {span &&
+          (drawerOpen ? (
+            <div className="graph-drawer" ref={drawer}>
+              <SpanDetails
+                span={span}
+                tree={tree}
+                now={now}
+                onSelect={onSelect}
+                onClose={() => onSelect(null)}
+                actions={
+                  <button className="drawer-toggle" title="Hide details (keeps the selection)" onClick={() => setDrawerOpen(false)}>
+                    »
+                  </button>
+                }
+              />
+            </div>
+          ) : (
+            <button className="drawer-tab" title="Show details" onClick={() => setDrawerOpen(true)}>
+              « Details
+            </button>
+          ))}
       </div>
     </div>
   );

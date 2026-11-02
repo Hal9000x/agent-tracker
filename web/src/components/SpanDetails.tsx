@@ -12,9 +12,11 @@ interface Props {
   now: number;
   onSelect: (id: string) => void;
   onClose: () => void;
+  /** Extra buttons at the end of the tab bar. */
+  actions?: ReactNode;
 }
 
-export function SpanDetails({ span, tree, now, onSelect, onClose }: Props) {
+export function SpanDetails({ span, tree, now, onSelect, onClose, actions }: Props) {
   const [tab, setTab] = useState<Tab>("Headers");
   return (
     <section className="details">
@@ -22,11 +24,14 @@ export function SpanDetails({ span, tree, now, onSelect, onClose }: Props) {
         <button className="close" title="Close" onClick={onClose}>
           ✕
         </button>
-        {TABS.map((t) => (
-          <button key={t} className={t === tab ? "tab active" : "tab"} onClick={() => setTab(t)}>
-            {t}
-          </button>
-        ))}
+        <div className="tab-list">
+          {TABS.map((t) => (
+            <button key={t} className={t === tab ? "tab active" : "tab"} onClick={() => setTab(t)}>
+              {t}
+            </button>
+          ))}
+        </div>
+        {actions}
       </div>
       <div className="details-body">
         {tab === "Headers" && <Headers span={span} tree={tree} now={now} onSelect={onSelect} />}
