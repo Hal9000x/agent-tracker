@@ -18,6 +18,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::claude_code::ClaudeCode;
+use crate::codex::Codex;
 use crate::demo;
 use crate::model::SpanUpdate;
 use crate::otlp;
@@ -26,6 +27,7 @@ use crate::store::Store;
 pub struct App {
     pub store: Store,
     pub claude_code: ClaudeCode,
+    pub codex: Codex,
     /// The --host address; requests naming any other host are refused.
     pub bind_host: String,
 }
@@ -41,6 +43,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/traces/{id}", get(get_trace).delete(delete_trace))
         .route("/api/stream", get(stream))
         .route("/api/hooks/claude-code", post(claude_code_hook))
+        .route("/api/hooks/codex", post(codex_hook))
         .route("/api/demo", post(play_demo))
         .route("/v1/traces", post(otlp_traces))
         .fallback(static_files)
@@ -140,6 +143,12 @@ async fn claude_code_hook(State(app): State<Arc<App>>, Json(ev): Json<Value>) ->
     Ok(Json(Value::Object(Default::default())))
 }
 
+async fn codex_hook(State(app): State<Arc<App>>, Json(ev): Json<Value>) -> Result<Json<Value>, ApiError> {
+    ingest(&app, app.codex.handle(&ev, now_ms(), |t| app.store.has_trace(t)))?;
+    // Codex reads the hook's stdout; an empty object asks for nothing.
+    Ok(Json(Value::Object(Default::default())))
+}
+
 /// Replays the built-in demo recording in real time; its traces arrive over the stream.
 async fn play_demo(State(app): State<Arc<App>>) -> StatusCode {
     let now = now_ms();
@@ -203,7 +212,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> Router {
-        router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), bind_host: "127.0.0.1".into() }))
+        router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "127.0.0.1".into() }))
     }
 
     async fn send(app: &Router, method: &str, uri: &str, content_type: &str, body: impl Into<Body>) -> (StatusCode, Value) {
@@ -266,7 +275,7 @@ mod tests {
         for ok in ["localhost:4318", "127.0.0.1:4318", "[::1]:4318", "localhost"] {
             assert_eq!(app.clone().oneshot(get(ok)).await.unwrap().status(), StatusCode::OK, "{ok}");
         }
-        let open = router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), bind_host: "0.0.0.0".into() }));
+        let open = router(Arc::new(App { store: Store::in_memory(), claude_code: ClaudeCode::default(), codex: Codex::new(None), bind_host: "0.0.0.0".into() }));
         assert_eq!(open.oneshot(get("tracker.lan:4318")).await.unwrap().status(), StatusCode::OK, "--host 0.0.0.0 serves any host");
     }
 
@@ -283,5 +292,11 @@ mod tests {
         assert_eq!((status, body), (StatusCode::OK, serde_json::json!({})));
         let (_, spans) = send(&app, "GET", "/api/traces/p", "", "").await;
         assert_eq!(spans.as_array().unwrap().len(), 2);
+
+        let hook = r#"{"session_id":"s","turn_id":"turn-1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+        let (status, body) = send(&app, "POST", "/api/hooks/codex", "application/json", hook).await;
+        assert_eq!((status, body), (StatusCode::OK, serde_json::json!({})));
+        let (_, spans) = send(&app, "GET", "/api/traces/turn-1", "", "").await;
+        assert_eq!(spans[0]["attrs"]["source"], "codex");
     }
 }
