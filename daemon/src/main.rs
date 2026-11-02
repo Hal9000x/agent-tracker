@@ -1,5 +1,6 @@
 mod api;
 mod claude_code;
+mod codex;
 mod demo;
 mod model;
 mod otlp;
@@ -98,11 +99,17 @@ async fn main() {
         Err(e) => fail(format!("cannot listen on {}:{}: {e}", args.host, args.port)),
     };
     let store = store::Store::open(&args.data).unwrap_or_else(|e| fail(format!("cannot open data dir {}: {e}", args.data.display())));
-    let app = Arc::new(api::App { store, claude_code: claude_code::ClaudeCode::default(), bind_host: args.host.clone() });
+    let app = Arc::new(api::App {
+        store,
+        claude_code: claude_code::ClaudeCode::default(),
+        codex: codex::Codex::default(),
+        bind_host: args.host.clone(),
+    });
 
     println!("Agent Tracker is running at {url}");
     println!("  data:  {}", args.data.display());
-    println!("  OTLP:  POST /v1/traces   spans: POST /api/spans   Claude Code hooks: POST /api/hooks/claude-code");
+    println!("  OTLP:  POST /v1/traces   spans: POST /api/spans");
+    println!("  hooks: POST /api/hooks/claude-code   POST /api/hooks/codex");
     println!("  Press Ctrl+C to stop.");
     if args.open {
         open_browser(&url);
@@ -118,7 +125,12 @@ mod tests {
     async fn detects_a_running_tracker_and_nothing_else() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = Arc::new(api::App { store: store::Store::in_memory(), claude_code: claude_code::ClaudeCode::default(), bind_host: "127.0.0.1".into() });
+        let app = Arc::new(api::App {
+            store: store::Store::in_memory(),
+            claude_code: claude_code::ClaudeCode::default(),
+            codex: codex::Codex::new(None),
+            bind_host: "127.0.0.1".into(),
+        });
         tokio::spawn(async move { axum::serve(listener, api::router(app)).await });
         assert!(tokio::task::spawn_blocking(move || tracker_running("127.0.0.1", port)).await.unwrap());
 
