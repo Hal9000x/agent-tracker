@@ -3,7 +3,7 @@
 import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -93,6 +93,23 @@ test("hooks that run at the same time all get pushed, and send the transcript on
   const events = pushed("s1");
   assert.deepEqual(events.map((e) => e.tool_use_id).sort(), ids);
   assert.equal(events.filter((e) => e.transcript_chunks.main).length, 1, "each run takes up where the last one stopped");
+});
+
+test("events reach the branch in the order they happened, whichever hook runs first", async () => {
+  // Another run holds the session's lock while these hooks start one after another.
+  const lock = join(state, "agent-tracker-s1.lock");
+  mkdirSync(lock);
+  const runs = [];
+  for (const id of ["t1", "t2", "t3", "t4", "t5"]) {
+    runs.push(runHook({ session_id: "s1", hook_event_name: "PreToolUse", tool_use_id: id }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  rmdirSync(lock);
+  await Promise.all(runs);
+
+  const times = pushed("s1").map((e) => e.agent_tracker_time);
+  assert.equal(times.length, 5);
+  assert.deepEqual(times, [...times].sort((a, b) => a - b));
 });
 
 test("events that couldn't be pushed go out with the next push", async () => {

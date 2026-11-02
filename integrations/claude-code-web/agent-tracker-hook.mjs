@@ -9,7 +9,7 @@
 // It prints nothing and always exits 0, so Claude Code carries on whatever happens here.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -78,10 +78,10 @@ function readState(path) {
 }
 
 /** Commits `spool` as events.jsonl on top of `parent` with plumbing, so HEAD, the index and the files stay as they are. */
-function commit(git, spool, parent, event) {
+function commit(git, spool, parent, count) {
   const blob = git(["hash-object", "-w", spool]);
   const tree = git(["mktree"], `100644 blob ${blob}\tevents.jsonl\n`);
-  return git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", `agent-tracker: ${event} [skip ci]`]);
+  return git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", `agent-tracker: ${count} event${count === 1 ? "" : "s"} [skip ci]`]);
 }
 
 async function main() {
@@ -94,22 +94,39 @@ async function main() {
   const env = { ...process.env, GIT_AUTHOR_NAME: "Agent Tracker", GIT_AUTHOR_EMAIL: "agent-tracker@localhost", GIT_COMMITTER_NAME: "Agent Tracker", GIT_COMMITTER_EMAIL: "agent-tracker@localhost", GIT_TERMINAL_PROMPT: "0" };
   const git = (args, input) => execFileSync("git", args, { cwd: repo, env, input, encoding: "utf8", timeout: 30_000, stdio: ["pipe", "pipe", "ignore"] }).trim();
 
+  // Hooks start in the order things happen but take the lock in any order, so each one
+  // queues its event at once, and whoever holds the lock sends everything queued, oldest first.
+  const queue = `${base}.queue`;
+  mkdirSync(queue, { recursive: true });
+  const queued = join(queue, `${String(time).padStart(15, "0")}-${process.pid}`);
+  writeFileSync(`${queued}.tmp`, JSON.stringify({ ...event, agent_tracker_time: time }));
+  renameSync(`${queued}.tmp`, `${queued}.json`);
+
   await locked(`${base}.lock`, () => {
     const state = readState(`${base}.json`);
-    const chunks = {};
-    for (const [key, path] of transcripts(event)) {
-      const from = state.offsets[path] ?? 0;
-      const [text, end] = readNew(path, from);
-      if (text) {
-        chunks[key] = { from, text };
-        state.offsets[path] = end;
+    const files = readdirSync(queue).filter((f) => f.endsWith(".json")).sort();
+    for (const file of files) {
+      const next = JSON.parse(readFileSync(join(queue, file), "utf8"));
+      const chunks = {};
+      for (const [key, path] of transcripts(next)) {
+        const from = state.offsets[path] ?? 0;
+        const [text, end] = readNew(path, from);
+        if (text) {
+          chunks[key] = { from, text };
+          state.offsets[path] = end;
+        }
       }
+      appendFileSync(`${base}.jsonl`, JSON.stringify({ ...next, transcript_chunks: chunks }) + "\n");
+      rmSync(join(queue, file));
     }
-    appendFileSync(`${base}.jsonl`, JSON.stringify({ ...event, transcript_chunks: chunks, agent_tracker_time: time }) + "\n");
-    state.head = commit(git, `${base}.jsonl`, state.head, event.hook_event_name);
-    writeFileSync(`${base}.json`, JSON.stringify(state));
-    // A failed push is retried by the next event, whose commit carries everything so far.
-    git(["push", "--quiet", "origin", `${state.head}:refs/heads/agent-tracker/${session}`]);
+    if (files.length) state.head = commit(git, `${base}.jsonl`, state.head, files.length);
+    try {
+      // A failed push is retried by the next hook run, whose commit carries everything so far.
+      if (state.head !== state.pushed) git(["push", "--quiet", "origin", `${state.head}:refs/heads/agent-tracker/${session}`]);
+      state.pushed = state.head;
+    } finally {
+      writeFileSync(`${base}.json`, JSON.stringify(state));
+    }
   });
 }
 

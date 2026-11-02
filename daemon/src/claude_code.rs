@@ -196,6 +196,8 @@ impl ClaudeCode {
         out.retain(|u| known(&u.trace_id) || current.contains(&u.trace_id));
 
         match event {
+            // A cloud session hands a subagent's result back as a prompt of the turn already running.
+            "UserPromptSubmit" if s("prompt_id").is_some() && s("prompt_id") == session.trace_id.as_deref() => return out,
             "UserPromptSubmit" => {
                 out.extend(session.hand_over(now));
                 let trace_id = s("prompt_id").map_or_else(|| format!("{session_id}-{now}"), str::to_string);
@@ -231,7 +233,7 @@ impl ClaudeCode {
         // A subagent already running when the tracker started never sent SubagentStart;
         // adopt it into the current turn so its steps hang off a real agent span.
         if let Some(agent) = agent_id
-            && event != "SubagentStart"
+            && !matches!(event, "SubagentStart" | "SubagentStop")
             && !session.agent_traces.contains_key(agent)
         {
             session.agent_traces.insert(agent.to_string(), trace_id.clone());
@@ -318,7 +320,8 @@ impl ClaudeCode {
                 });
             }
             "SubagentStop" => {
-                let Some(agent_id) = agent_id else { return out };
+                // An agent seen only stopping is one Claude Code ran for itself, with nothing to show.
+                let Some(agent_id) = agent_id.filter(|a| session.agent_traces.contains_key(*a)) else { return out };
                 session.closed(&trace_id, agent_id);
                 session.agent_traces.remove(agent_id);
                 let mut attrs = Map::new();
@@ -650,6 +653,47 @@ mod tests {
         let p2 = store.trace("p2").unwrap();
         assert!(p2.iter().all(|s| s.span_id != "t1"));
         assert_eq!(p2.iter().find(|s| s.span_id == MAIN).unwrap().status, Status::Ok);
+    }
+
+    #[test]
+    fn a_message_handed_into_the_running_turn_stays_part_of_it() {
+        let store = Store::in_memory();
+        let cc = ClaudeCode::default();
+        let send = |ev: Value, t: f64| store.ingest(cc.handle(&ev, t, |id| store.has_trace(id)), t).unwrap();
+        let ev = |name: &str, extra: Value| {
+            let mut e = serde_json::json!({"session_id": "s", "prompt_id": "p1", "hook_event_name": name});
+            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            e
+        };
+        send(ev("UserPromptSubmit", serde_json::json!({"prompt": "read the notes"})), 1.0);
+        // A cloud session hands a subagent's result back as a prompt of the same turn.
+        send(ev("UserPromptSubmit", serde_json::json!({"prompt": "<agent-message from=\"a1\">\nthe notes say hi"})), 2.0);
+        send(ev("Stop", serde_json::json!({"last_assistant_message": "done"})), 3.0);
+
+        let spans = store.trace("p1").unwrap();
+        let by = |id: &str| spans.iter().find(|s| s.span_id == id).unwrap_or_else(|| panic!("no span {id}"));
+        assert_eq!(by(PROMPT).name, "read the notes");
+        let main = by(MAIN);
+        assert_eq!((main.start, main.end, main.attrs.get("ended_by")), (1.0, Some(3.0), None));
+    }
+
+    #[test]
+    fn an_agent_seen_only_stopping_is_left_out() {
+        let store = Store::in_memory();
+        let cc = ClaudeCode::default();
+        let send = |ev: Value, t: f64| store.ingest(cc.handle(&ev, t, |id| store.has_trace(id)), t).unwrap();
+        let ev = |name: &str, extra: Value| {
+            let mut e = serde_json::json!({"session_id": "s", "prompt_id": "p1", "hook_event_name": name});
+            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            e
+        };
+        send(ev("UserPromptSubmit", serde_json::json!({"prompt": "hi"})), 1.0);
+        send(ev("Stop", serde_json::json!({"last_assistant_message": "hello"})), 2.0);
+        // Claude Code runs agents of its own after a reply, with no type and no SubagentStart.
+        send(ev("SubagentStop", serde_json::json!({"agent_id": "a9", "agent_type": ""})), 3.0);
+
+        let ids: Vec<String> = store.trace("p1").unwrap().into_iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![PROMPT, MAIN]);
     }
 
     #[test]
