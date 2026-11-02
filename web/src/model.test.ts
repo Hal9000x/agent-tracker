@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentGraph, agentOf, buildTree, compileFilter, flowEdges, flowRanks, lineage, niceStep, packLanes, selfTime, type Kind, type Span } from "./model";
+import { agentGraph, agentOf, buildTree, compileFilter, flowEdges, flowRanks, fmtAgo, lineage, niceStep, packLanes, selfTime, type Kind, type Span } from "./model";
 
 let seq = 0;
 function sp(span_id: string, parent_id: string | undefined, kind: Kind, start: number, end: number | undefined, extra: Partial<Span> = {}): Span {
@@ -213,6 +213,10 @@ describe("helpers", () => {
     // Without the back flag, the cycle b -> c -> b is cut at b.
     expect(ranks([e("a", "b"), e("b", "c"), e("c", "b"), e("d", "c")])).toEqual({ a: 0, b: 1, c: 2, d: 0 });
     expect(flowRanks(spans, [e("b", "c"), e("c", "b")]).size).toBe(4);
+  });
+
+  it("formats how long ago something happened", () => {
+    expect([fmtAgo(30_000), fmtAgo(5 * 60_000), fmtAgo(338 * 60_000), fmtAgo(50 * 3_600_000)]).toEqual(["just now", "5 min ago", "5 h ago", "2 d ago"]);
   });
 
   it("picks 1-2-5 tick steps", () => {

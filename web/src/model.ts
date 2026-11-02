@@ -419,6 +419,14 @@ export function fmtDuration(ms: number): string {
   return `${(ms / 60_000).toFixed(1)} min`;
 }
 
+export function fmtAgo(ms: number): string {
+  const min = Math.floor(ms / 60_000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min} min ago`;
+  const h = Math.floor(min / 60);
+  return h < 24 ? `${h} h ago` : `${Math.floor(h / 24)} d ago`;
+}
+
 export function fmtCount(n: number): string {
   return n < 1000 ? String(n) : n < 1e6 ? `${(n / 1000).toFixed(1)}k` : `${(n / 1e6).toFixed(1)}M`;
 }

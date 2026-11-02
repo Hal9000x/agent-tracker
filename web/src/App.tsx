@@ -1,9 +1,10 @@
 import { Component, useEffect, useMemo, useState, type ReactNode } from "react";
 import { playDemo, useNow, useTracker } from "./api";
+import { ConnectGuide } from "./components/ConnectGuide";
 import { GraphView } from "./components/GraphView";
 import { NetworkView } from "./components/NetworkView";
 import { TraceList } from "./components/TraceList";
-import { buildTree } from "./model";
+import { buildTree, type TraceSummary } from "./model";
 
 type View = "network" | "graph";
 
@@ -35,6 +36,7 @@ export function App() {
   const [paused, setPaused] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [clip, setClip] = useState<[number, number] | null>(null);
+  const [connecting, setConnecting] = useState(false);
   const { traces, spans, conn } = useTracker(route.traceId, paused);
 
   const list = useMemo(() => [...traces.values()].sort((a, b) => b.start - a.start), [traces]);
@@ -68,6 +70,9 @@ export function App() {
         </nav>
         <span className="grow" />
         {trace && <span className="trace-title">{trace.name}</span>}
+        <button className="tool-btn" title="Set up Claude Code, OpenTelemetry or your own agents" onClick={() => setConnecting(true)}>
+          ⚡ Connect
+        </button>
         <button className="tool-btn" title="Replay three sample agent runs" onClick={playDemo}>
           ▶ Demo
         </button>
@@ -84,10 +89,23 @@ export function App() {
               {route.view === "network" ? <NetworkView {...viewProps} paused={paused} onPause={setPaused} /> : <GraphView {...viewProps} />}
             </ViewBoundary>
           ) : (
-            <EmptyState hasTraces={list.length > 0} />
+            <EmptyState traces={list} />
           )}
         </main>
       </div>
+      {connecting && (
+        <div className="modal-backdrop" onClick={() => setConnecting(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h2>Connect a harness</h2>
+              <button className="close" title="Close" onClick={() => setConnecting(false)}>
+                ✕
+              </button>
+            </div>
+            <ConnectGuide traces={list} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -121,22 +139,17 @@ class ViewBoundary extends Component<BoundaryProps, { error: string | null; retr
   }
 }
 
-function EmptyState({ hasTraces }: { hasTraces: boolean }) {
-  if (hasTraces) return <div className="empty center">Select a trace.</div>;
+function EmptyState({ traces }: { traces: TraceSummary[] }) {
+  if (traces.length) return <div className="empty center">Select a trace.</div>;
   return (
     <div className="empty center onboarding">
       <h2>Waiting for agent traces</h2>
-      <p>Send something to this tracker and it shows up here live.</p>
+      <p>Connect a harness below and its runs show up here live, or try the demo first.</p>
       <button className="primary-btn" onClick={playDemo}>
         ▶ Play demo runs
       </button>
       <p className="muted">A single agent, a research swarm and a support handoff, replayed in real time.</p>
-      <h3>Claude Code</h3>
-      <p>
-        Add the hooks from <code>integrations/claude-code/settings.json</code> to your Claude Code settings.
-      </p>
-      <h3>OpenTelemetry</h3>
-      <pre>OTEL_EXPORTER_OTLP_TRACES_ENDPOINT={location.origin}/v1/traces</pre>
+      <ConnectGuide traces={traces} />
     </div>
   );
 }
