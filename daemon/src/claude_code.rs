@@ -2,13 +2,19 @@
 //! Each submitted prompt becomes one trace: prompt -> main agent -> tool calls,
 //! with subagents nested under the Agent tool call that spawned them.
 //! Fields are read leniently because the hook payload schema grows over time.
+//! Model calls come from the session transcript every event names, read up to
+//! its end on each event.
 
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 
 use crate::model::{Kind, SpanUpdate, Status};
+use crate::transcript::Transcript;
 
 const PROMPT: &str = "prompt";
 const MAIN: &str = "main";
@@ -16,6 +22,13 @@ const MAIN: &str = "main";
 #[derive(Default)]
 pub struct ClaudeCode {
     sessions: Mutex<HashMap<String, Session>>,
+    /// Transcripts are read only from here; None reads none.
+    projects: Option<PathBuf>,
+}
+
+/// Where Claude Code keeps session transcripts.
+pub fn projects_dir() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".claude").join("projects"))
 }
 
 struct PendingAgent {
@@ -43,6 +56,62 @@ struct Session {
     agent_traces: HashMap<String, String>,
     /// Spans that started and have not ended.
     open: Vec<OpenSpan>,
+    /// Transcripts being followed, by resolved path.
+    tails: HashMap<PathBuf, Tail>,
+}
+
+/// A transcript file: how far it has been read, and the parse state there.
+struct Tail {
+    offset: u64,
+    transcript: Transcript,
+}
+
+impl Tail {
+    fn read_new(&mut self, path: &Path, out: &mut Vec<SpanUpdate>) -> io::Result<()> {
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut buf = vec![0; 64 << 10];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.offset += n as u64;
+            out.extend(self.transcript.feed(&buf[..n]));
+        }
+    }
+}
+
+/// Model calls appended to the event's transcripts (the session's, and the
+/// subagent's on a subagent event) since they were last read.
+fn read_transcripts(projects: &Path, session: &mut Session, ev: &Value) -> Vec<SpanUpdate> {
+    let s = |k: &str| ev.get(k).and_then(Value::as_str);
+    let Some(main) = s("transcript_path").map(PathBuf::from) else { return Vec::new() };
+    let mut files = vec![(MAIN, main.clone())];
+    if let Some(agent) = s("agent_id") {
+        let derived = main.with_extension("").join("subagents").join(format!("agent-{agent}.jsonl"));
+        files.push((agent, s("agent_transcript_path").map_or(derived, PathBuf::from)));
+    }
+    let mut out = Vec::new();
+    for (parent, path) in files {
+        let Some(path) = transcript_file(projects, &path) else { continue };
+        let tail = session.tails.entry(path.clone()).or_insert_with(|| Tail { offset: 0, transcript: Transcript::new(parent) });
+        // A transcript that can't be read only means no model calls this time.
+        let _ = tail.read_new(&path, &mut out);
+        // A stopped subagent writes nothing more.
+        if parent != MAIN && s("hook_event_name") == Some("SubagentStop") {
+            session.tails.remove(&path);
+        }
+    }
+    out
+}
+
+/// `path` resolved, if it is a `.jsonl` file under `projects`. Paths come from
+/// the request, so nothing else is ever opened.
+fn transcript_file(projects: &Path, path: &Path) -> Option<PathBuf> {
+    let path = fs::canonicalize(path).ok()?;
+    let inside = path.starts_with(fs::canonicalize(projects).ok()?);
+    (inside && path.extension().is_some_and(|e| e == "jsonl") && path.is_file()).then_some(path)
 }
 
 impl Session {
@@ -76,6 +145,11 @@ fn text_output(v: Option<&Value>) -> Option<Value> {
 }
 
 impl ClaudeCode {
+    /// Also reads model calls from session transcripts under `projects` (see [`projects_dir`]).
+    pub fn new(projects: Option<PathBuf>) -> Self {
+        ClaudeCode { projects, ..Default::default() }
+    }
+
     /// `known` says whether a trace is already stored, so a tracker restarted
     /// mid-turn resumes that turn's trace instead of re-creating its prompt.
     pub fn handle(&self, ev: &Value, now: f64, known: impl Fn(&str) -> bool) -> Vec<SpanUpdate> {
@@ -84,7 +158,10 @@ impl ClaudeCode {
         let event = s("hook_event_name").unwrap_or_default();
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.entry(session_id.to_string()).or_default();
-        let mut out = Vec::new();
+        let mut out = match &self.projects {
+            Some(projects) => read_transcripts(projects, session, ev),
+            None => Vec::new(),
+        };
 
         match event {
             "UserPromptSubmit" => {
@@ -271,6 +348,9 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
     use super::*;
     use crate::store::Store;
 
@@ -398,6 +478,106 @@ mod tests {
         let ev = serde_json::json!({"session_id": "s", "hook_event_name": "PostToolUse", "agent_id": "a9", "agent_type": "Explore", "tool_name": "Grep", "tool_use_id": "t2"});
         let tool = cc.handle(&ev, 1000.0, |_| false).pop().unwrap();
         assert_eq!((tool.parent_id.as_deref(), tool.agent.as_deref()), (Some("a9"), Some("Explore")));
+    }
+
+    const TRANSCRIPT: &str = include_str!("../fixtures/claude-code-transcript/sess-t.jsonl");
+    const SUBAGENT_TRANSCRIPT: &str = include_str!("../fixtures/claude-code-transcript/sess-t/subagents/agent-a1.jsonl");
+
+    /// A fresh `<base>/projects/proj/sess-t/subagents`, laid out like `~/.claude/projects`. Returns `<base>`.
+    fn scratch(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("agent-tracker-test-cc-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("projects/proj/sess-t/subagents")).unwrap();
+        base
+    }
+
+    fn event(transcript: &Path, name: &str, extra: Value) -> Value {
+        let mut e = serde_json::json!({"session_id": "sess-t", "prompt_id": "p1", "transcript_path": transcript, "hook_event_name": name});
+        e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        e
+    }
+
+    /// (span id, parent, end) of each llm span in the trace.
+    fn llm_spans(store: &Store, trace_id: &str) -> Vec<(String, String, Option<f64>)> {
+        let spans = store.trace(trace_id).unwrap_or_default().into_iter().filter(|s| s.kind == Kind::Llm);
+        spans.map(|s| (s.span_id, s.parent_id.unwrap_or_default(), s.end)).collect()
+    }
+
+    #[test]
+    fn model_calls_are_read_as_the_transcript_grows() {
+        let base = scratch("tail");
+        let path = base.join("projects/proj/sess-t.jsonl");
+        // The first write stops halfway through msg_02's line.
+        let cut = TRANSCRIPT.find(r#""msg_02""#).unwrap();
+        fs::write(&path, &TRANSCRIPT[..cut]).unwrap();
+        let store = Store::in_memory();
+        let cc = ClaudeCode::new(Some(base.join("projects")));
+        let send = |ev: Value, t: f64| store.ingest(cc.handle(&ev, t, |id| store.has_trace(id)), t).unwrap();
+        let t0 = 1_768_471_200_000.0; // 2026-01-15T10:00:00Z, where the fixture starts
+
+        send(event(&path, "UserPromptSubmit", serde_json::json!({"prompt": "Find the launch code"})), t0);
+        assert_eq!(llm_spans(&store, "p1"), [("msg_01".into(), MAIN.into(), Some(t0 + 3000.0))]);
+
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(&TRANSCRIPT.as_bytes()[cut..]).unwrap();
+        send(event(&path, "Stop", serde_json::json!({"last_assistant_message": "The launch code is 42."})), t0 + 10_100.0);
+        let spans = llm_spans(&store, "p1");
+        assert_eq!(spans.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["msg_01", "msg_02"]);
+        assert_eq!(spans[1], ("msg_02".into(), MAIN.into(), Some(t0 + 10_000.0)));
+        // The next turn's call lands in that turn's trace.
+        assert_eq!(llm_spans(&store, "p2"), [("msg_03".into(), MAIN.into(), Some(t0 + 62_000.0))]);
+        let p1 = store.trace("p1").unwrap();
+        assert_eq!(p1.iter().find(|s| s.span_id == "msg_02").unwrap().output, Some(Value::from("The launch code is 42.")));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn subagent_events_read_the_subagent_transcript() {
+        let base = scratch("subagent");
+        let path = base.join("projects/proj/sess-t.jsonl");
+        fs::write(&path, "").unwrap();
+        fs::write(base.join("projects/proj/sess-t/subagents/agent-a1.jsonl"), SUBAGENT_TRANSCRIPT).unwrap();
+        // SubagentStop names its transcript, wherever it is.
+        let moved = base.join("projects/proj/moved-a2.jsonl");
+        fs::write(&moved, SUBAGENT_TRANSCRIPT.replace("msg_s", "msg_t")).unwrap();
+        let store = Store::in_memory();
+        let cc = ClaudeCode::new(Some(base.join("projects")));
+        let send = |ev: Value| store.ingest(cc.handle(&ev, 1.0, |id| store.has_trace(id)), 1.0).unwrap();
+
+        send(event(&path, "UserPromptSubmit", serde_json::json!({"prompt": "Find the launch code"})));
+        send(event(&path, "SubagentStart", serde_json::json!({"agent_id": "a1", "agent_type": "Explore"})));
+        send(event(&path, "SubagentStop", serde_json::json!({"agent_id": "a2", "agent_type": "Explore", "agent_transcript_path": moved})));
+        let mut parents: Vec<(String, String)> = llm_spans(&store, "p1").into_iter().map(|(id, parent, _)| (id, parent)).collect();
+        parents.sort();
+        let expected = [("msg_s1", "a1"), ("msg_s2", "a1"), ("msg_t1", "a2"), ("msg_t2", "a2")];
+        assert_eq!(parents, expected.map(|(id, parent)| (id.to_string(), parent.to_string())));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn only_jsonl_files_under_the_projects_dir_are_read() {
+        let base = scratch("outside");
+        let projects = base.join("projects");
+        fs::create_dir_all(base.join("elsewhere")).unwrap();
+        for p in ["elsewhere/sess-t.jsonl", "projects/proj/sess-t.txt", "projects/proj/sess-t.jsonl"] {
+            fs::write(base.join(p), TRANSCRIPT).unwrap();
+        }
+        let cc = ClaudeCode::new(Some(projects.clone()));
+        let span_ids = |i: usize, path: PathBuf| {
+            let ev = event(&path, "UserPromptSubmit", serde_json::json!({"session_id": format!("s{i}"), "prompt": "hi"}));
+            cc.handle(&ev, 1.0, |_| false).into_iter().map(|u| u.span_id).collect::<Vec<_>>()
+        };
+        let refused = [
+            base.join("elsewhere/sess-t.jsonl"),
+            projects.join("proj/../../elsewhere/sess-t.jsonl"),
+            projects.join("proj/sess-t.txt"),
+            projects.join("proj/missing.jsonl"),
+            projects.join("proj"),
+        ];
+        for (i, path) in refused.into_iter().enumerate() {
+            assert_eq!(span_ids(i, path.clone()), [PROMPT, MAIN], "{}", path.display());
+        }
+        assert_eq!(span_ids(99, projects.join("proj/sess-t.jsonl")), ["msg_01", "msg_02", "msg_03", PROMPT, MAIN]);
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
