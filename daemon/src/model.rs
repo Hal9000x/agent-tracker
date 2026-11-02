@@ -213,12 +213,15 @@ impl TraceSummary {
         let spans: Vec<&Span> = spans.into_iter().collect();
         let ids: HashSet<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
         let is_root = |s: &Span| s.parent_id.as_deref().is_none_or(|p| !ids.contains(p));
-        let root = spans
-            .iter()
-            .copied()
-            .filter(|s| is_root(s))
-            .min_by(|a, b| a.start.total_cmp(&b.start))
-            .or_else(|| spans.first().copied())?;
+        let earliest_root = |message_only: bool| {
+            spans
+                .iter()
+                .copied()
+                .filter(|s| is_root(s) && (!message_only || s.kind == Kind::Message))
+                .min_by(|a, b| a.start.total_cmp(&b.start))
+        };
+        // Orphans (a subagent tool whose agent is in another trace) can start before the message.
+        let root = earliest_root(true).or_else(|| earliest_root(false)).or_else(|| spans.first().copied())?;
         let running = spans.iter().any(|s| s.status == Status::Running);
         let errors = spans.iter().filter(|s| s.status == Status::Error).count();
         let mut agents: Vec<String> = Vec::new();
@@ -297,6 +300,26 @@ mod tests {
         let a = Span::from_update(SpanUpdate { tokens_in: Some(u64::MAX), tokens_out: Some(1), ..SpanUpdate::new("t", "a") }, 0.0, 1);
         let b = Span::from_update(SpanUpdate { tokens_in: Some(5), ..SpanUpdate::new("t", "b") }, 0.0, 2);
         assert_eq!(TraceSummary::of("t", [&a, &b]).unwrap().tokens, u64::MAX);
+    }
+
+    #[test]
+    fn trace_is_named_after_its_message_not_an_earlier_orphan() {
+        // A subagent tool whose agent span sits in another trace has no parent here.
+        let orphan = Span::from_update(
+            SpanUpdate { parent_id: Some("elsewhere".into()), kind: Some(Kind::Tool), name: Some("WebFetch".into()), start: Some(1.0), ..SpanUpdate::new("t", "w") },
+            0.0,
+            1,
+        );
+        let mut attrs = Map::new();
+        attrs.insert("source".into(), "claude-code".into());
+        let message = Span::from_update(
+            SpanUpdate { kind: Some(Kind::Message), name: Some("hi".into()), start: Some(5.0), attrs, ..SpanUpdate::new("t", "m") },
+            0.0,
+            2,
+        );
+        let s = TraceSummary::of("t", [&orphan, &message]).unwrap();
+        assert_eq!((s.name.as_str(), s.source.as_deref()), ("hi", Some("claude-code")));
+        assert_eq!(TraceSummary::of("t", [&orphan]).unwrap().name, "WebFetch", "without a message the earliest root names it");
     }
 
     #[test]

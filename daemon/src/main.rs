@@ -4,6 +4,7 @@ mod demo;
 mod model;
 mod otlp;
 mod store;
+mod transcript;
 
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::net::TcpStream;
@@ -98,7 +99,8 @@ async fn main() {
         Err(e) => fail(format!("cannot listen on {}:{}: {e}", args.host, args.port)),
     };
     let store = store::Store::open(&args.data).unwrap_or_else(|e| fail(format!("cannot open data dir {}: {e}", args.data.display())));
-    let app = Arc::new(api::App { store, claude_code: claude_code::ClaudeCode::default(), bind_host: args.host.clone() });
+    let claude_code = claude_code::ClaudeCode::new(claude_code::projects_dir());
+    let app = Arc::new(api::App { store, claude_code, bind_host: args.host.clone() });
 
     println!("Agent Tracker is running at {url}");
     println!("  data:  {}", args.data.display());
